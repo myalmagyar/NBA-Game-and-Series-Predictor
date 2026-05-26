@@ -2,6 +2,9 @@
 
 Streamlit app for NBA single-game, series, and bracket predictions.
 
+This repo now also includes a separate first-pass MLB predictor in `app_mlb.py`.
+It writes its own `mlb_*` data/model files and does not replace the NBA app.
+
 ## Free Data Refresh Commands
 
 ```bash
@@ -12,6 +15,27 @@ python src/features.py
 python src/team_strength.py
 python src/train_model.py
 ```
+
+## MLB App
+
+Run the MLB app separately:
+
+```bash
+streamlit run app_mlb.py
+```
+
+Build or refresh the MLB data/model files:
+
+```bash
+python src/mlb_collect_data.py
+python src/mlb_features.py
+python src/mlb_team_strength.py
+python src/mlb_train_model.py
+```
+
+The MLB version currently uses the public MLB Stats API, team form, rest, run
+differential, and Elo-style features. Pitcher and bullpen features are the next
+accuracy upgrade.
 
 `src/injuries.py` fetches the latest official NBA injury-report PDF for free and
 saves `data/current_injuries.csv`.

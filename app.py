@@ -2,13 +2,15 @@
 
 from collections import Counter
 from datetime import date, datetime
+import json
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import html
 import math
 import random
 import re
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
 import subprocess
 import sys
 import time
@@ -1250,12 +1252,34 @@ APP_CSS = """
         overflow-wrap: anywhere;
     }
 
+    .today-team-score {
+        color: var(--accent-purple);
+        font-size: 1.55rem;
+        font-weight: 950;
+        line-height: 1;
+        margin-top: 0.18rem;
+    }
+
     .today-score {
         color: var(--accent-purple);
         font-size: 0.98rem;
         font-weight: 950;
         line-height: 1;
         margin-top: 0.12rem;
+    }
+
+    .today-play-line {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-left: 4px solid var(--accent-orange);
+        border-radius: 8px;
+        color: #334155;
+        font-size: 0.8rem;
+        font-weight: 800;
+        line-height: 1.3;
+        margin: 0.55rem 0 0.45rem;
+        padding: 0.42rem 0.55rem;
+        overflow-wrap: anywhere;
     }
 
     .today-breakdown-card {
@@ -1590,6 +1614,49 @@ APP_CSS = """
         font-size: 0.76rem;
         font-weight: 850;
         padding: 0.22rem 0.55rem;
+    }
+
+    .today-prediction-grid {
+        display: grid;
+        gap: 0.45rem;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        margin-top: 0.58rem;
+    }
+
+    .today-prediction-cell {
+        background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+        border: 1px solid #dbe4ee;
+        border-top: 3px solid var(--team-color, var(--accent-blue));
+        border-radius: 8px;
+        box-shadow: var(--shadow-sm);
+        min-width: 0;
+        padding: 0.48rem 0.55rem;
+    }
+
+    .today-prediction-label {
+        color: var(--muted);
+        font-size: 0.66rem;
+        font-weight: 950;
+        letter-spacing: 0.04em;
+        line-height: 1.05;
+        text-transform: uppercase;
+    }
+
+    .today-prediction-value {
+        color: var(--ink);
+        font-size: 0.92rem;
+        font-weight: 950;
+        line-height: 1.1;
+        margin-top: 0.22rem;
+        overflow-wrap: anywhere;
+    }
+
+    .today-prediction-note {
+        color: #64748b;
+        font-size: 0.72rem;
+        font-weight: 800;
+        line-height: 1.15;
+        margin-top: 0.16rem;
     }
 
     .profile-hero {
@@ -2126,8 +2193,13 @@ def clear_app_caches() -> None:
         load_backtest_metrics,
         load_calibration_metrics,
         load_live_scoreboard_games,
+        load_espn_scoreboard_games,
+        load_espn_latest_play,
+        load_scoreboard_v3_games,
+        load_live_playbyplay_state,
         load_injury_report_schedule_games,
         load_today_games,
+        load_next_upcoming_games,
         load_nba_schedule_games,
     ]:
         loader.clear()
@@ -2174,6 +2246,45 @@ def inject_custom_css() -> None:
 def get_teams_from_strength(strength: pd.DataFrame) -> list[str]:
     """Return sorted NBA team names."""
     return sorted(strength["TEAM_NAME"].unique())
+
+
+def get_known_team_names() -> set[str]:
+    """Return normalized team names available to the model."""
+    try:
+        strength = load_team_strength()
+    except Exception:
+        return set()
+
+    if strength.empty or "TEAM_NAME" not in strength.columns:
+        return set()
+
+    return {
+        str(team).strip().lower()
+        for team in strength["TEAM_NAME"].dropna().unique()
+    }
+
+
+def is_known_team_name(team_name: object) -> bool:
+    """Return whether a name maps to a team in the current strength table."""
+    normalized = str(team_name).strip().lower()
+    return bool(normalized and normalized in get_known_team_names())
+
+
+def filter_games_to_known_teams(games: pd.DataFrame) -> pd.DataFrame:
+    """Drop schedule rows with non-NBA placeholder teams."""
+    if games.empty or not {"Home Team", "Away Team"}.issubset(games.columns):
+        return games
+
+    known_teams = get_known_team_names()
+
+    if not known_teams:
+        return games
+
+    keep_mask = (
+        games["Home Team"].astype(str).str.strip().str.lower().isin(known_teams)
+        & games["Away Team"].astype(str).str.strip().str.lower().isin(known_teams)
+    )
+    return games[keep_mask].copy().reset_index(drop=True)
 
 
 def safe_team_index(teams: list[str], team_name: str, fallback: int = 0) -> int:
@@ -2283,7 +2394,247 @@ def normalize_live_team_name(team_data: dict) -> str:
     return combined_name or str(team_data.get("teamTricode", "Unknown"))
 
 
-@st.cache_data(ttl=300)
+def normalize_score_value(value: object) -> object:
+    """Return a score value unless the feed is sending an empty/NaN placeholder."""
+    if value is None:
+        return ""
+
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    text = str(value).strip()
+    return "" if not text or text.lower() == "nan" else value
+
+
+def coerce_game_status_code(value: object) -> int:
+    """Coerce NBA status codes where 1=scheduled, 2=live, 3=final."""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_score_pair(
+    home_score: object,
+    away_score: object,
+    status_code: object,
+) -> tuple[object, object]:
+    """Normalize score values, hiding placeholder 0-0 before tipoff."""
+    home_score = normalize_score_value(home_score)
+    away_score = normalize_score_value(away_score)
+
+    if coerce_game_status_code(status_code) <= 1:
+        home_text = str(home_score).strip()
+        away_text = str(away_score).strip()
+
+        if home_text in {"", "0", "0.0"} and away_text in {"", "0", "0.0"}:
+            return "", ""
+
+    return home_score, away_score
+
+
+def get_espn_competitor_team_name(competitor: dict) -> str | None:
+    """Map an ESPN scoreboard competitor into a local team name."""
+    team = competitor.get("team", {}) or {}
+    abbreviation = str(team.get("abbreviation", "")).strip()
+
+    if abbreviation:
+        mapped_team = get_team_name_by_abbreviation(abbreviation)
+
+        if mapped_team:
+            return mapped_team
+
+    return str(team.get("displayName") or team.get("name") or "").strip() or None
+
+
+def coerce_espn_game_status_code(status_payload: dict) -> int:
+    """Map ESPN game status into NBA-style status codes."""
+    status_type = status_payload.get("type", {}) or {}
+    state = str(status_type.get("state", "")).strip().lower()
+
+    if bool(status_type.get("completed")) or state == "post":
+        return 3
+    if state == "in":
+        return 2
+    return 1
+
+
+@st.cache_data(ttl=1)
+def load_espn_scoreboard_games(game_date: str | None = None) -> pd.DataFrame:
+    """Fetch ESPN's public scoreboard as the fastest live score source."""
+    if game_date is None:
+        game_date = pd.Timestamp.now(tz=ZoneInfo("America/New_York")).strftime("%Y%m%d")
+
+    url = (
+        "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?"
+        + urlencode({"dates": game_date})
+    )
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=LIVE_SCOREBOARD_TIMEOUT_SECONDS) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return pd.DataFrame()
+
+    rows: list[dict[str, object]] = []
+
+    for event in data.get("events", []) or []:
+        competitions = event.get("competitions", []) or []
+        if not competitions:
+            continue
+
+        competition = competitions[0]
+        competitors = competition.get("competitors", []) or []
+        home_competitor = next(
+            (
+                competitor
+                for competitor in competitors
+                if str(competitor.get("homeAway", "")).lower() == "home"
+            ),
+            None,
+        )
+        away_competitor = next(
+            (
+                competitor
+                for competitor in competitors
+                if str(competitor.get("homeAway", "")).lower() == "away"
+            ),
+            None,
+        )
+
+        if home_competitor is None or away_competitor is None:
+            continue
+
+        home_team = get_espn_competitor_team_name(home_competitor)
+        away_team = get_espn_competitor_team_name(away_competitor)
+
+        if not home_team or not away_team:
+            continue
+
+        status_payload = competition.get("status", {}) or {}
+        status_type = status_payload.get("type", {}) or {}
+        status_code = coerce_espn_game_status_code(status_payload)
+        status_text = (
+            str(status_type.get("shortDetail", "")).strip()
+            or str(status_type.get("detail", "")).strip()
+            or str(status_type.get("description", "")).strip()
+        )
+        home_score, away_score = normalize_score_pair(
+            home_competitor.get("score", ""),
+            away_competitor.get("score", ""),
+            status_code,
+        )
+        game_datetime = pd.to_datetime(
+            competition.get("date") or event.get("date"),
+            errors="coerce",
+            utc=True,
+        )
+
+        rows.append(
+            {
+                "Game ID": f"ESPN_{event.get('id', '')}",
+                "ESPN Game ID": str(event.get("id", "")),
+                "Game Date": game_date,
+                "Game DateTime": game_datetime,
+                "Game Time": status_text,
+                "Status": "Scheduled" if status_code <= 1 else status_text,
+                "Game Status Code": status_code,
+                "Period": status_payload.get("period", 0),
+                "Game Clock": status_payload.get("displayClock", ""),
+                "Home Team": home_team,
+                "Away Team": away_team,
+                "Home Score": home_score,
+                "Away Score": away_score,
+                "Source": "ESPN scoreboard",
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=1)
+def load_espn_latest_play(espn_game_id: str) -> dict[str, object] | None:
+    """Fetch the most recent ESPN play for one game."""
+    espn_game_id = str(espn_game_id).strip()
+
+    if not espn_game_id:
+        return None
+
+    url = (
+        "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?"
+        + urlencode({"event": espn_game_id})
+    )
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=LIVE_SCOREBOARD_TIMEOUT_SECONDS) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    plays = [
+        play
+        for play in data.get("plays", []) or []
+        if str(play.get("text", "")).strip()
+    ]
+
+    if not plays:
+        return None
+
+    def sort_key(play: dict) -> int:
+        try:
+            return int(play.get("sequenceNumber") or play.get("id") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    latest_play = sorted(plays, key=sort_key)[-1]
+    period = latest_play.get("period", {}) or {}
+    clock = latest_play.get("clock", {}) or {}
+
+    return {
+        "text": str(latest_play.get("text", "")).strip(),
+        "period": period.get("number", ""),
+        "period_label": str(period.get("displayValue", "")).strip(),
+        "clock": str(clock.get("displayValue", "")).strip(),
+        "home_score": latest_play.get("homeScore", ""),
+        "away_score": latest_play.get("awayScore", ""),
+    }
+
+
+def format_latest_play_line(play: dict[str, object] | None) -> str:
+    """Format the latest live play into one compact card line."""
+    if not play:
+        return ""
+
+    text = str(play.get("text", "")).strip()
+
+    if not text:
+        return ""
+
+    period_label = format_live_period_label(play.get("period"))
+    clock = str(play.get("clock", "")).strip()
+    prefix = " ".join(part for part in [period_label, clock] if part)
+
+    return f"{prefix} - {text}" if prefix else text
+
+
+@st.cache_data(ttl=1)
 def load_live_scoreboard_games() -> pd.DataFrame:
     """Fetch free live NBA scoreboard games when internet access is available."""
     try:
@@ -2305,6 +2656,13 @@ def load_live_scoreboard_games() -> pd.DataFrame:
         if not home_team or not away_team:
             continue
 
+        status_code = game.get("gameStatus", 0)
+        home_score, away_score = normalize_score_pair(
+            home_team_data.get("score", ""),
+            away_team_data.get("score", ""),
+            status_code,
+        )
+
         rows.append(
             {
                 "Game ID": str(game.get("gameId", "")),
@@ -2321,17 +2679,200 @@ def load_live_scoreboard_games() -> pd.DataFrame:
                 or game.get("gameEt")
                 or game.get("gameStatusText", ""),
                 "Status": game.get("gameStatusText", "Scheduled"),
+                "Game Status Code": status_code,
                 "Period": game.get("period", 0),
                 "Game Clock": game.get("gameClock", ""),
                 "Home Team": home_team,
                 "Away Team": away_team,
-                "Home Score": home_team_data.get("score", ""),
-                "Away Score": away_team_data.get("score", ""),
+                "Home Score": home_score,
+                "Away Score": away_score,
                 "Source": "NBA live scoreboard",
             }
         )
 
     return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=1)
+def load_scoreboard_v3_games(game_date: str | None = None) -> pd.DataFrame:
+    """Fetch the daily scoreboard v3 feed as a fallback live source."""
+    if game_date is None:
+        game_date = pd.Timestamp.now(tz=ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+
+    try:
+        from nba_api.stats.endpoints import ScoreboardV3
+
+        board = ScoreboardV3(game_date=game_date, timeout=LIVE_SCOREBOARD_TIMEOUT_SECONDS)
+        games = board.get_dict().get("scoreboard", {}).get("games", []) or []
+    except Exception:
+        return pd.DataFrame()
+
+    if not games:
+        return pd.DataFrame()
+
+    rows: list[dict[str, object]] = []
+
+    for game in games:
+        game_id = str(game.get("gameId", "")).strip()
+        if not game_id:
+            continue
+
+        home_team_data = game.get("homeTeam", {}) or {}
+        away_team_data = game.get("awayTeam", {}) or {}
+        home_team = get_schedule_team_name(
+            home_team_data.get("teamId"),
+            home_team_data.get("teamTricode"),
+            home_team_data.get("teamCity"),
+            home_team_data.get("teamName"),
+        )
+        away_team = get_schedule_team_name(
+            away_team_data.get("teamId"),
+            away_team_data.get("teamTricode"),
+            away_team_data.get("teamCity"),
+            away_team_data.get("teamName"),
+        )
+
+        if not home_team or not away_team:
+            continue
+
+        status_code = game.get("gameStatus", 0)
+        home_score, away_score = normalize_score_pair(
+            home_team_data.get("score", ""),
+            away_team_data.get("score", ""),
+            status_code,
+        )
+
+        rows.append(
+            {
+                "Game ID": game_id,
+                "Game Date": game_date,
+                "Game DateTime": pd.to_datetime(game.get("gameTimeUTC"), errors="coerce", utc=True),
+                "Game Time": str(game.get("gameStatusText", "")).strip(),
+                "Status": str(game.get("gameStatusText", "")).strip(),
+                "Game Status Code": status_code,
+                "Period": game.get("period", 0),
+                "Game Clock": game.get("gameClock", ""),
+                "Home Team": home_team,
+                "Away Team": away_team,
+                "Home Score": home_score,
+                "Away Score": away_score,
+                "Source": "NBA scoreboard v3",
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=1)
+def load_live_playbyplay_state(game_id: str) -> dict[str, object] | None:
+    """Fetch the latest live play-by-play snapshot for one game."""
+    game_id = str(game_id).strip()
+    if not game_id:
+        return None
+
+    try:
+        from nba_api.live.nba.endpoints.playbyplay import PlayByPlay
+
+        board = PlayByPlay(game_id, timeout=LIVE_SCOREBOARD_TIMEOUT_SECONDS)
+        actions = board.get_dict().get("game", {}).get("actions", []) or []
+    except Exception:
+        return None
+
+    if not actions:
+        return None
+
+    actions_df = pd.DataFrame(actions)
+    if actions_df.empty:
+        return None
+
+    if "actionNumber" in actions_df.columns:
+        actions_df = actions_df.sort_values("actionNumber")
+    elif "orderNumber" in actions_df.columns:
+        actions_df = actions_df.sort_values("orderNumber")
+
+    latest = actions_df.iloc[-1]
+    home_score = latest.get("scoreHome", "")
+    away_score = latest.get("scoreAway", "")
+    period = latest.get("period", 0)
+    clock = latest.get("clock", "")
+
+    status = ""
+    if clock and format_live_clock(clock):
+        try:
+            period_num = int(float(period))
+        except (TypeError, ValueError):
+            period_num = 0
+        if period_num > 0:
+            status = build_live_detail_label("", period_num, clock, fallback="")
+
+    return {
+        "Game ID": game_id,
+        "Status": status,
+        "Period": period,
+        "Game Clock": clock,
+        "Home Score": home_score,
+        "Away Score": away_score,
+        "Source": "NBA live play-by-play",
+    }
+
+
+@st.cache_data(ttl=1)
+def resolve_live_today_snapshot(game_id: str, home_team: str, away_team: str) -> dict[str, object] | None:
+    """Return the freshest live row for a matchup if one exists."""
+    game_id = str(game_id).strip()
+    home_team = str(home_team).strip().lower()
+    away_team = str(away_team).strip().lower()
+
+    def iter_candidate_rows() -> list[pd.Series]:
+        frames = [
+            load_espn_scoreboard_games(),
+            load_scoreboard_v3_games(),
+            load_live_scoreboard_games(),
+        ]
+        candidates: list[pd.Series] = []
+
+        for frame in frames:
+            if frame.empty:
+                continue
+
+            by_game_id = pd.DataFrame()
+            if game_id and "Game ID" in frame.columns:
+                by_game_id = frame[frame["Game ID"].astype(str).eq(game_id)]
+                if not by_game_id.empty:
+                    candidates.extend(row for _, row in by_game_id.iterrows())
+
+            if candidates:
+                continue
+
+            if {"Home Team", "Away Team"}.issubset(frame.columns) and home_team and away_team:
+                matchup_rows = frame[
+                    frame["Home Team"].astype(str).str.lower().eq(home_team)
+                    & frame["Away Team"].astype(str).str.lower().eq(away_team)
+                ]
+                if not matchup_rows.empty:
+                    candidates.extend(row for _, row in matchup_rows.iterrows())
+
+        return candidates
+
+    for candidate in iter_candidate_rows():
+        status = str(candidate.get("Status", "")).strip().lower()
+        status_code = coerce_game_status_code(candidate.get("Game Status Code", 0))
+        score_present = (
+            bool(str(candidate.get("Home Score", "")).strip())
+            or bool(str(candidate.get("Away Score", "")).strip())
+        )
+        clock_present = bool(format_live_clock(candidate.get("Game Clock")))
+        period_present = bool(format_live_period_label(candidate.get("Period")))
+
+        if (
+            status_code > 1
+            or "final" in status
+            or (score_present and status_code != 1)
+            or ((clock_present or period_present) and status_code != 1)
+        ):
+            return candidate.to_dict()
+
+    return None
 
 
 @st.cache_data
@@ -2381,31 +2922,329 @@ def load_injury_report_schedule_games() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def filter_games_to_today(games: pd.DataFrame) -> pd.DataFrame:
+    """Keep only rows whose game date is today in Eastern time."""
+    if games.empty or "Game Date" not in games.columns:
+        return games
+
+    today_et = pd.Timestamp.now(tz=ZoneInfo("America/New_York")).date()
+    game_dates = pd.to_datetime(games["Game Date"], errors="coerce")
+    return games[game_dates.dt.date.eq(today_et)].copy().reset_index(drop=True)
+
+
+def build_playoff_series_key(home_team: object, away_team: object) -> str:
+    """Build the same unordered matchup key used by playoff series results."""
+    teams = sorted([str(home_team).strip(), str(away_team).strip()])
+    return " vs ".join(teams)
+
+
+def load_completed_playoff_series_lookup(
+    season: str | None = None,
+) -> dict[str, dict[str, object]]:
+    """Return completed playoff series keyed by unordered team matchup."""
+    try:
+        results = build_completed_playoff_game_results(season)
+    except Exception:
+        return {}
+
+    if results.empty or "Series Key" not in results.columns:
+        return {}
+
+    completed_series: dict[str, dict[str, object]] = {}
+
+    for series_key, games in results.groupby("Series Key", sort=False):
+        wins = games["Winner"].astype(str).value_counts()
+
+        if wins.empty or int(wins.iloc[0]) < 4:
+            continue
+
+        last_game_date = pd.to_datetime(games["GAME_DATE"], errors="coerce").max()
+        completed_series[str(series_key)] = {
+            "winner": str(wins.index[0]),
+            "wins": int(wins.iloc[0]),
+            "games_played": int(len(games)),
+            "last_game_date": last_game_date,
+        }
+
+    return completed_series
+
+
+def filter_schedule_playoff_rows(games: pd.DataFrame) -> pd.DataFrame:
+    """Keep rows that look like playoff schedule games."""
+    if games.empty:
+        return games
+
+    games = filter_games_to_known_teams(games)
+
+    if games.empty:
+        return games
+
+    masks = []
+
+    if "Series Game Number" in games.columns:
+        masks.append(games["Series Game Number"].notna())
+
+    if "Game ID" in games.columns:
+        game_ids = games["Game ID"].astype(str).str.strip()
+        masks.append(game_ids.str.startswith("004") | game_ids.str.startswith("4"))
+
+    label_columns = [
+        column
+        for column in ["Game Label", "Game SubLabel"]
+        if column in games.columns
+    ]
+
+    for column in label_columns:
+        masks.append(
+            games[column]
+            .astype(str)
+            .str.contains(r"\bGame\s+\d+\b", case=False, na=False)
+        )
+
+    if not masks:
+        return games
+
+    combined_mask = masks[0].copy()
+
+    for mask in masks[1:]:
+        combined_mask = combined_mask | mask
+
+    return games[combined_mask].copy().reset_index(drop=True)
+
+
+def build_completed_series_lookup_from_schedule(games: pd.DataFrame) -> dict[str, dict[str, object]]:
+    """Infer completed playoff series from final score rows in a schedule frame."""
+    required_columns = {"Home Team", "Away Team", "Home Score", "Away Score"}
+
+    if games.empty or not required_columns.issubset(games.columns):
+        return {}
+
+    games = filter_schedule_playoff_rows(games)
+
+    if games.empty:
+        return {}
+
+    rows = []
+
+    for _, row in games.iterrows():
+        status = str(row.get("Status", "")).strip().lower()
+        status_code = coerce_game_status_code(row.get("Game Status Code", 0))
+
+        if status_code < 3 and "final" not in status:
+            continue
+
+        home_team = str(row.get("Home Team", "")).strip()
+        away_team = str(row.get("Away Team", "")).strip()
+        home_score = normalize_score_value(row.get("Home Score", ""))
+        away_score = normalize_score_value(row.get("Away Score", ""))
+
+        if not home_team or not away_team or home_score == "" or away_score == "":
+            continue
+
+        if not is_known_team_name(home_team) or not is_known_team_name(away_team):
+            continue
+
+        try:
+            home_points = int(float(home_score))
+            away_points = int(float(away_score))
+        except (TypeError, ValueError):
+            continue
+
+        if home_points == away_points:
+            continue
+
+        rows.append(
+            {
+                "Series Key": build_playoff_series_key(home_team, away_team),
+                "Winner": home_team if home_points > away_points else away_team,
+                "GAME_DATE": row.get("Game Date"),
+            }
+        )
+
+    if not rows:
+        return {}
+
+    results = pd.DataFrame(rows)
+    completed_series: dict[str, dict[str, object]] = {}
+
+    for series_key, series_games in results.groupby("Series Key", sort=False):
+        wins = series_games["Winner"].astype(str).value_counts()
+
+        if wins.empty or int(wins.iloc[0]) < 4:
+            continue
+
+        completed_series[str(series_key)] = {
+            "winner": str(wins.index[0]),
+            "wins": int(wins.iloc[0]),
+            "games_played": int(len(series_games)),
+            "last_game_date": pd.to_datetime(
+                series_games["GAME_DATE"],
+                errors="coerce",
+            ).max(),
+        }
+
+    return completed_series
+
+
+def is_scheduled_completed_series_row(
+    row: pd.Series,
+    completed_series: dict[str, dict[str, object]],
+) -> bool:
+    """Return whether a scheduled row belongs to a series already won."""
+    if not completed_series:
+        return False
+
+    series_key = build_playoff_series_key(row.get("Home Team", ""), row.get("Away Team", ""))
+    series_state = completed_series.get(series_key)
+
+    if not series_state:
+        return False
+
+    status = str(row.get("Status", "")).strip().lower()
+    status_code = coerce_game_status_code(row.get("Game Status Code", 0))
+
+    if status_code > 1 or "final" in status or "live" in status:
+        return False
+
+    score_present = (
+        bool(str(normalize_score_value(row.get("Home Score", ""))).strip())
+        or bool(str(normalize_score_value(row.get("Away Score", ""))).strip())
+    )
+
+    if score_present:
+        return False
+
+    return True
+
+
+def filter_completed_series_scheduled_games(
+    games: pd.DataFrame,
+    season: str | None = None,
+) -> pd.DataFrame:
+    """Drop scheduled-only games for playoff series that are already complete."""
+    if games.empty or not {"Home Team", "Away Team"}.issubset(games.columns):
+        return games
+
+    completed_series = load_completed_playoff_series_lookup(season)
+    completed_series.update(build_completed_series_lookup_from_schedule(games))
+
+    if not completed_series:
+        return games
+
+    keep_mask = ~games.apply(
+        lambda row: is_scheduled_completed_series_row(row, completed_series),
+        axis=1,
+    )
+    return games[keep_mask].copy().reset_index(drop=True)
+
+
+def normalize_schedule_games_for_display(games: pd.DataFrame) -> pd.DataFrame:
+    """Normalize schedule rows into the same display schema as live games."""
+    if games.empty:
+        return games
+
+    games = games.copy()
+    games = filter_games_to_known_teams(games)
+
+    if games.empty:
+        return games
+
+    games["Game Date"] = pd.to_datetime(games["Game Date"], errors="coerce")
+
+    if "Game DateTime" in games.columns:
+        games["Game DateTime"] = games["Game DateTime"].apply(coerce_game_datetime)
+    else:
+        games["Game DateTime"] = pd.NaT
+
+    games["Source"] = "NBA schedule"
+
+    def normalize_schedule_status(row: pd.Series) -> pd.Series:
+        status = str(row.get("Status", "")).strip()
+        tipoff = format_tipoff_label(row.get("Game DateTime"))
+        status_code = coerce_game_status_code(row.get("Game Status Code"))
+
+        if status_code <= 1:
+            row["Game Time"] = tipoff or str(row.get("Game Time", "")).strip()
+            row["Status"] = "Scheduled"
+        else:
+            row["Game Time"] = status or tipoff
+            row["Status"] = status or ("Final" if status_code >= 3 else "Live")
+
+        return row
+
+    return games.apply(normalize_schedule_status, axis=1)
+
+
+def select_next_upcoming_slate(games: pd.DataFrame) -> pd.DataFrame:
+    """Return all games on the nearest future date with scheduled games."""
+    if games.empty or "Game Date" not in games.columns:
+        return pd.DataFrame()
+
+    games = games.copy()
+    game_dates = pd.to_datetime(games["Game Date"], errors="coerce")
+    today_et = pd.Timestamp.now(tz=ZoneInfo("America/New_York")).date()
+    future_mask = game_dates.dt.date.gt(today_et)
+
+    if not future_mask.any():
+        return pd.DataFrame()
+
+    next_game_date = game_dates[future_mask].dt.date.min()
+    return games[game_dates.dt.date.eq(next_game_date)].copy().reset_index(drop=True)
+
+
+@st.cache_data(ttl=60)
+def load_next_upcoming_games() -> pd.DataFrame:
+    """Return the next future NBA slate when there are no games today."""
+    try:
+        season = get_latest_playoff_season(load_raw_games())
+        schedule_games = load_nba_schedule_games(season)
+    except Exception:
+        return pd.DataFrame()
+
+    if schedule_games.empty:
+        return pd.DataFrame()
+
+    schedule_games = normalize_schedule_games_for_display(schedule_games)
+    schedule_games = filter_completed_series_scheduled_games(
+        schedule_games,
+        season=season,
+    )
+    upcoming_games = select_next_upcoming_slate(schedule_games)
+
+    return upcoming_games.sort_values(
+        ["Game Date", "Game DateTime", "Game ID"],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+def format_game_slate_label(games: pd.DataFrame) -> str:
+    """Format the date label for a slate of games."""
+    if games.empty or "Game Date" not in games.columns:
+        return ""
+
+    parsed = pd.to_datetime(games.iloc[0].get("Game Date"), errors="coerce")
+
+    if pd.isna(parsed):
+        return ""
+
+    return f"{parsed.strftime('%A, %B')} {parsed.day}"
+
+
+@st.cache_data(ttl=1)
 def load_today_games() -> pd.DataFrame:
     """Return current NBA games using the live scoreboard with a local fallback."""
+    espn_games = load_espn_scoreboard_games()
     live_games = load_live_scoreboard_games()
+    v3_games = load_scoreboard_v3_games()
 
     try:
         schedule_games = load_nba_schedule_games()
     except Exception:
         schedule_games = pd.DataFrame()
 
-    if schedule_games.empty and live_games.empty:
-        return load_injury_report_schedule_games()
-
     if not schedule_games.empty:
         today_et = pd.Timestamp.now(tz=ZoneInfo("America/New_York")).normalize()
-        schedule_games = schedule_games.copy()
-        schedule_games["Game Date"] = pd.to_datetime(
-            schedule_games["Game Date"], errors="coerce"
-        )
-
-        if "Game DateTime" in schedule_games.columns:
-            schedule_games["Game DateTime"] = schedule_games["Game DateTime"].apply(
-                coerce_game_datetime
-            )
-        else:
-            schedule_games["Game DateTime"] = pd.NaT
+        schedule_games = normalize_schedule_games_for_display(schedule_games)
 
         schedule_games = schedule_games[
             schedule_games["Game Date"].dt.tz_localize(ZoneInfo("America/New_York"))
@@ -2414,44 +3253,90 @@ def load_today_games() -> pd.DataFrame:
         ].copy()
 
         if not schedule_games.empty:
-            schedule_games["Source"] = "NBA schedule"
-            schedule_games["Game Time"] = schedule_games["Game DateTime"].apply(
-                format_tipoff_label
-            )
-            schedule_games["Status"] = schedule_games["Game Time"].apply(
-                lambda value: "Scheduled" if value else "Scheduled"
-            )
-
-    if live_games.empty:
-        return schedule_games if not schedule_games.empty else load_injury_report_schedule_games()
+            schedule_games = filter_completed_series_scheduled_games(schedule_games)
+    if schedule_games.empty and espn_games.empty and live_games.empty and v3_games.empty:
+        fallback_games = filter_games_to_today(load_injury_report_schedule_games())
+        return filter_completed_series_scheduled_games(fallback_games)
 
     if schedule_games.empty:
-        return live_games
+        if not espn_games.empty:
+            return filter_completed_series_scheduled_games(espn_games)
+        live_fallback = v3_games if not v3_games.empty else live_games
+        return filter_completed_series_scheduled_games(live_fallback)
+
+    def normalize_name(value: object) -> str:
+        return str(value).strip().lower()
+
+    def build_game_key(home_team: object, away_team: object) -> tuple[str, str]:
+        return (normalize_name(home_team), normalize_name(away_team))
 
     merged_rows = []
     live_lookup = {
-        (str(row["Home Team"]).lower(), str(row["Away Team"]).lower()): row
+        build_game_key(row.get("Home Team"), row.get("Away Team")): row
         for _, row in live_games.iterrows()
+    }
+    espn_lookup = {
+        build_game_key(row.get("Home Team"), row.get("Away Team")): row
+        for _, row in espn_games.iterrows()
+    }
+    v3_lookup = {
+        build_game_key(row.get("Home Team"), row.get("Away Team")): row
+        for _, row in v3_games.iterrows()
     }
 
     for _, row in schedule_games.iterrows():
-        key = (str(row["Home Team"]).lower(), str(row["Away Team"]).lower())
-        live_row = live_lookup.pop(key, None)
+        merged = row.to_dict()
+        key = build_game_key(row.get("Home Team"), row.get("Away Team"))
+        live_row = espn_lookup.pop(key, None)
+        if live_row is None:
+            live_row = v3_lookup.pop(key, None)
+            if live_row is None:
+                live_row = live_lookup.pop(key, None)
+            else:
+                live_lookup.pop(key, None)
+        else:
+            v3_lookup.pop(key, None)
+            live_lookup.pop(key, None)
+        if live_row is not None:
+            for column in live_row.index:
+                if (
+                    column == "Game ID"
+                    and str(merged.get("Game ID", "")).strip()
+                    and str(live_row.get("Source", "")) == "ESPN scoreboard"
+                ):
+                    continue
+                merged[column] = live_row[column]
+
+        if pd.isna(merged.get("Game DateTime")):
+            merged["Game DateTime"] = row.get("Game DateTime")
 
         if live_row is not None:
-            merged = row.to_dict()
-            for column in live_row.index:
-                merged[column] = live_row[column]
-            if pd.isna(merged.get("Game DateTime")):
-                merged["Game DateTime"] = row.get("Game DateTime")
-            merged_rows.append(merged)
-        else:
-            merged_rows.append(row.to_dict())
+            live_game_id = str(merged.get("Game ID", "")).strip()
+            live_state = load_live_playbyplay_state(live_game_id)
+            if live_state is not None:
+                live_status = str(live_state.get("Status", "")).strip().lower()
+                if live_status or live_state.get("Home Score") != "" or live_state.get("Away Score") != "":
+                    existing_break_label = format_live_break_label(merged.get("Status", ""))
+                    for column in ["Status", "Period", "Game Clock", "Home Score", "Away Score"]:
+                        if column == "Status" and existing_break_label:
+                            continue
+                        value = live_state.get(column)
+                        if value is not None and str(value).strip() != "":
+                            merged[column] = value
+                    merged["Source"] = str(live_state.get("Source", merged.get("Source", "NBA live scoreboard")))
+
+        merged_rows.append(merged)
+
+    for live_row in espn_lookup.values():
+        merged_rows.append(live_row.to_dict())
 
     for live_row in live_lookup.values():
         merged_rows.append(live_row.to_dict())
 
-    return pd.DataFrame(merged_rows)
+    for live_row in v3_lookup.values():
+        merged_rows.append(live_row.to_dict())
+
+    return filter_completed_series_scheduled_games(pd.DataFrame(merged_rows))
 
 
 def format_live_period_label(period: object) -> str:
@@ -2485,6 +3370,48 @@ def format_live_clock(clock: object) -> str:
     minutes = int(match.group(1))
     seconds = int(round(float(match.group(2))))
     return f"{minutes}:{seconds:02d}"
+
+
+def format_live_break_label(status: object) -> str:
+    """Return status labels that should outrank a zero game clock."""
+    text = str(status).strip()
+    status_lower = text.lower()
+
+    if "halftime" in status_lower or "half time" in status_lower:
+        return "Halftime"
+
+    if status_lower in {"half", "the half"}:
+        return "Halftime"
+
+    if status_lower.startswith("end of"):
+        return text
+
+    return ""
+
+
+def build_live_detail_label(
+    status: object,
+    period: object,
+    clock: object,
+    fallback: str = "Live",
+) -> str:
+    """Build the card's live detail text from status, period, and clock."""
+    break_label = format_live_break_label(status)
+
+    if break_label:
+        return break_label
+
+    period_label = format_live_period_label(period)
+    clock_label = format_live_clock(clock)
+
+    if period_label and clock_label:
+        return f"{period_label} {clock_label}"
+    if period_label:
+        return period_label
+    if clock_label:
+        return clock_label
+
+    return str(status).strip() or fallback
 
 
 def coerce_game_datetime(value: object) -> pd.Timestamp:
@@ -2549,27 +3476,71 @@ def build_today_game_timing_state(game: pd.Series) -> dict[str, str | bool]:
     status = str(game.get("Status", "")).strip()
     source = str(game.get("Source", ""))
     game_dt = coerce_game_datetime(game.get("Game DateTime"))
+    game_time = str(game.get("Game Time", "")).strip()
+    home_score = str(game.get("Home Score", "")).strip()
+    away_score = str(game.get("Away Score", "")).strip()
+    game_clock = format_live_clock(game.get("Game Clock"))
+    period_label = format_live_period_label(game.get("Period"))
+    live_state, is_live = build_live_game_state(game)
+    game_id = str(game.get("Game ID", "")).strip()
+    home_team = str(game.get("Home Team", "")).strip()
+    away_team = str(game.get("Away Team", "")).strip()
 
-    if source == "NBA live scoreboard":
-        live_state, is_live = build_live_game_state(game)
+    if is_live:
+        return {
+            "mode": "live",
+            "badge": "LIVE",
+            "detail": live_state,
+            "status": status or "Live",
+            "refresh": "15",
+        }
 
-        if is_live:
-            return {
-                "mode": "live",
-                "badge": "LIVE",
-                "detail": live_state,
-                "status": status or "Live",
-                "refresh": "15",
-            }
+    if "final" in status.lower():
+        return {
+            "mode": "final",
+            "badge": "FINAL",
+            "detail": "",
+            "status": "Final",
+            "refresh": "0",
+        }
 
-        if "final" in status.lower():
-            return {
-                "mode": "final",
-                "badge": "FINAL",
-                "detail": "",
-                "status": "Final",
-                "refresh": "0",
-            }
+    should_probe_live = False
+    if not pd.isna(game_dt):
+        now = pd.Timestamp.now(tz=game_dt.tzinfo)
+        should_probe_live = now >= (game_dt - pd.Timedelta(minutes=2))
+    if (
+        source in {"ESPN scoreboard", "NBA live scoreboard", "NBA live boxscore", "NBA live play-by-play", "NBA scoreboard v3"}
+        and coerce_game_status_code(game.get("Game Status Code", 0)) > 1
+    ):
+        should_probe_live = True
+
+    if should_probe_live:
+        live_snapshot = resolve_live_today_snapshot(game_id, home_team, away_team)
+        if live_snapshot is not None:
+            snapshot_status = str(live_snapshot.get("Status", "")).strip()
+            snapshot_detail = build_live_detail_label(
+                snapshot_status,
+                live_snapshot.get("Period"),
+                live_snapshot.get("Game Clock"),
+            )
+
+            if "final" in snapshot_status.lower():
+                return {
+                    "mode": "final",
+                    "badge": "FINAL",
+                    "detail": "",
+                    "status": "Final",
+                    "refresh": "0",
+                }
+
+            if snapshot_detail or str(live_snapshot.get("Home Score", "")).strip() or str(live_snapshot.get("Away Score", "")).strip():
+                return {
+                    "mode": "live",
+                    "badge": "LIVE",
+                    "detail": snapshot_detail,
+                    "status": snapshot_status or "Live",
+                    "refresh": "15",
+                }
 
     if not pd.isna(game_dt):
         now = pd.Timestamp.now(tz=game_dt.tzinfo)
@@ -2585,22 +3556,23 @@ def build_today_game_timing_state(game: pd.Series) -> dict[str, str | bool]:
                 "target_iso": game_dt.isoformat(),
             }
 
-        if source == "NBA live scoreboard":
+        if coerce_game_status_code(game.get("Game Status Code", 0)) <= 1:
             return {
-                "mode": "live",
-                "badge": "LIVE",
-                "detail": "Tipoff started",
-                "status": status or "Live",
+                "mode": "starting",
+                "badge": "Starting soon",
+                "detail": f"Tipoff {format_tipoff_label(game_dt)}",
+                "status": "Starting soon",
                 "refresh": "15",
+                "target_iso": game_dt.isoformat(),
             }
 
+    if game_time and source not in {"ESPN scoreboard", "NBA live scoreboard", "NBA live boxscore", "NBA live play-by-play", "NBA scoreboard v3"}:
         return {
             "mode": "starting",
             "badge": "Starting soon",
-            "detail": f"Tipoff {format_tipoff_label(game_dt)}",
+            "detail": f"Tipoff {game_time}",
             "status": status or "Starting",
             "refresh": "0",
-            "target_iso": game_dt.isoformat(),
         }
 
     return {
@@ -2616,27 +3588,67 @@ def build_live_game_state(game: pd.Series) -> tuple[str, bool]:
     """Return a compact live state label and whether the game is live."""
     status = str(game.get("Status", "")).strip()
     source = str(game.get("Source", ""))
-
-    if source != "NBA live scoreboard":
-        return status, False
-
+    game_clock = format_live_clock(game.get("Game Clock"))
+    period_label = format_live_period_label(game.get("Period"))
+    live_detail = build_live_detail_label(
+        status,
+        game.get("Period"),
+        game.get("Game Clock"),
+    )
+    status_code_value = coerce_game_status_code(game.get("Game Status Code", 0))
+    home_score = str(game.get("Home Score", "")).strip()
+    away_score = str(game.get("Away Score", "")).strip()
     status_lower = status.lower()
-    if "final" in status_lower:
+    in_progress_hint = any(
+        token in status_lower
+        for token in [
+            "live",
+            "in progress",
+            "q1",
+            "q2",
+            "q3",
+            "q4",
+            "1st qtr",
+            "2nd qtr",
+            "3rd qtr",
+            "4th qtr",
+            "qtr",
+            "end of",
+            "halftime",
+            "half",
+            "ot",
+        ]
+    )
+
+    if status_code_value >= 3 or "final" in status_lower:
         return "Final", False
+
+    if status_code_value == 2:
+        return live_detail, True
+
+    if source == "NBA scoreboard v3":
+        if status_code_value <= 1 and not period_label and not game_clock:
+            return status or "Scheduled", False
+
+        if live_detail:
+            return live_detail, True
+
+        if status_code_value > 1:
+            return status or "Live", True
+        return status or "Scheduled", False
+
     if "scheduled" in status_lower or "pregame" in status_lower:
         return status or "Scheduled", False
 
-    period_label = format_live_period_label(game.get("Period"))
-    clock_label = format_live_clock(game.get("Game Clock"))
+    if not (period_label or game_clock or in_progress_hint):
+        return status or "Scheduled", False
 
-    if period_label and clock_label:
-        return f"{period_label} {clock_label}", True
-    if period_label:
-        return period_label, True
-    if clock_label:
-        return clock_label, True
+    if live_detail:
+        return live_detail, True
+    if in_progress_hint:
+        return status or "Live", True
 
-    return status or "Live", True
+    return status or "Scheduled", False
 
 
 def render_live_refresh_script(enabled: bool, interval_ms: int = 15000) -> None:
@@ -2677,24 +3689,45 @@ def get_today_refresh_interval(games: pd.DataFrame) -> int | None:
 def render_today_games_live_fragment(compact: bool = False, show_schedule_rows: bool = False) -> None:
     """Render today games in a fragment that updates countdowns without rerunning the page."""
     games = load_today_games()
+    is_upcoming_slate = False
 
     if games.empty:
-        st.info("No current games were found in the free live feed or saved injury report.")
-        return
+        games = load_next_upcoming_games()
+        is_upcoming_slate = True
+
+        if games.empty:
+            st.info(
+                "No current or upcoming games were found in the free schedule feeds."
+            )
+            return
 
     predictions = build_today_game_predictions(games)
     source = str(games.iloc[0].get("Source", "Current games"))
-    st.caption(f"{len(games)} game(s) loaded from {source}.")
+
+    if is_upcoming_slate:
+        slate_label = format_game_slate_label(games)
+        st.info("No NBA games are scheduled for today.")
+        render_section_kicker("Upcoming Games", slate_label or None)
+        st.caption(f"{len(games)} upcoming game(s) loaded from {source}.")
+    else:
+        st.caption(f"{len(games)} game(s) loaded from {source}.")
+
+    if not compact:
+        render_upset_alert_board(predictions)
+
     render_today_games_cards(predictions, compact=compact)
 
     if show_schedule_rows:
-        with st.expander("Schedule rows", expanded=False):
+        expander_label = "Upcoming schedule rows" if is_upcoming_slate else "Schedule rows"
+        with st.expander(expander_label, expanded=False):
             display_columns = [
                 "Game Date",
                 "Game Time",
                 "Status",
                 "Away Team",
+                "Away Score",
                 "Home Team",
+                "Home Score",
                 "Predicted Winner",
                 "Winner Probability",
                 "Home Win Probability",
@@ -2754,7 +3787,7 @@ def get_schedule_team_name(team_id: object, abbreviation: object, city: object, 
     return None
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=60)
 def load_nba_schedule_games(season: str | None = None) -> pd.DataFrame:
     """Fetch free NBA schedule rows with a graceful offline fallback."""
     if season is None:
@@ -2795,11 +3828,20 @@ def load_nba_schedule_games(season: str | None = None) -> pd.DataFrame:
         if not home_team or not away_team:
             continue
 
+        if not is_known_team_name(home_team) or not is_known_team_name(away_team):
+            continue
+
         game_date = pd.to_datetime(game.get("gameDate"), errors="coerce")
         game_datetime = pd.to_datetime(
             game.get("gameDateTimeUTC") or game.get("gameDateTimeEst"),
             errors="coerce",
             utc=True,
+        )
+        status_code = game.get("gameStatus", 0)
+        home_score, away_score = normalize_score_pair(
+            game.get("homeTeam_score", ""),
+            game.get("awayTeam_score", ""),
+            status_code,
         )
 
         rows.append(
@@ -2809,8 +3851,13 @@ def load_nba_schedule_games(season: str | None = None) -> pd.DataFrame:
                 "Game DateTime": game_datetime,
                 "Game Time": str(game.get("gameStatusText", "")).strip(),
                 "Status": str(game.get("gameStatusText", "")).strip(),
+                "Game Status Code": status_code,
+                "Period": game.get("period", 0),
+                "Game Clock": game.get("gameClock", ""),
                 "Home Team": home_team,
                 "Away Team": away_team,
+                "Home Score": home_score,
+                "Away Score": away_score,
                 "Series Game Number": parse_series_game_number(
                     game.get("seriesGameNumber")
                 )
@@ -2932,41 +3979,6 @@ def render_dashboard_cards(cards: list[dict[str, str]]) -> None:
         )
 
     st.html(f'<div class="dashboard-grid">{"".join(card_html)}</div>')
-
-
-def render_refresh_controls() -> None:
-    """Render refresh buttons for the local data pipeline."""
-    with st.expander("Refresh data", expanded=False):
-        left_col, right_col = st.columns([1, 1])
-
-        with left_col:
-            refresh_clicked = st.button(
-                "Refresh data",
-                type="primary",
-                width="stretch",
-                key="refresh_data",
-            )
-
-        with right_col:
-            retrain_model = st.checkbox(
-                "Retrain model too",
-                value=False,
-                help="This re-runs the training script after the free data refresh.",
-                key="refresh_retrain_model",
-            )
-
-        st.caption(
-            "Refreshes raw games, injuries, player impact, feature rows, and team strength."
-        )
-
-        if refresh_clicked:
-            with st.spinner("Refreshing local data..."):
-                try:
-                    run_data_refresh_pipeline(retrain_model=retrain_model)
-                    st.success("Data refreshed.")
-                    st.rerun()
-                except Exception as error:
-                    st.error(f"Refresh failed: {error}")
 
 
 def render_team_mini_rows(rows: list[dict]) -> None:
@@ -4448,6 +5460,886 @@ def predict_game(
     return winner, home_probability, away_probability, probability_details
 
 
+def probability_to_logit(probability: float) -> float:
+    """Convert a probability into log-odds with numerical guards."""
+    safe_probability = min(max(float(probability), 0.001), 0.999)
+    return math.log(safe_probability / (1 - safe_probability))
+
+
+def logit_to_probability(logit: float) -> float:
+    """Convert log-odds back into a probability."""
+    return 1 / (1 + math.exp(-float(logit)))
+
+
+def format_probability_shift(shift: float) -> str:
+    """Format a probability delta as percentage points."""
+    return f"{shift * 100:+.1f} pts"
+
+
+def predict_game_probability_details_with_feature_overrides(
+    home_team: str,
+    away_team: str,
+    strength: pd.DataFrame,
+    model_bundle: dict,
+    team_adjustments: dict[str, float] | None = None,
+    playoff_context: dict[str, float] | None = None,
+    feature_overrides: dict[str, float] | None = None,
+    home_elo_advantage: float = HOME_ELO_ADVANTAGE,
+) -> dict:
+    """Predict a matchup after controlled feature overrides for scenario analysis."""
+    model = model_bundle["model"]
+    feature_columns = model_bundle["feature_columns"]
+    prediction_row = build_prediction_row_from_strength(
+        home_team=home_team,
+        away_team=away_team,
+        strength=strength,
+        feature_columns=feature_columns,
+        playoff_context=playoff_context,
+        team_adjustments=team_adjustments,
+    )
+
+    for feature_column, value in (feature_overrides or {}).items():
+        if feature_column in prediction_row.columns:
+            prediction_row.loc[0, feature_column] = float(value)
+
+    model_probability = float(model.predict_proba(prediction_row)[0][1])
+    home_strength = get_team_strength_row(home_team, strength)
+    away_strength = get_team_strength_row(away_team, strength)
+    elo_probability = expected_score(
+        float(home_strength["ELO"]) + home_elo_advantage,
+        float(away_strength["ELO"]),
+    )
+    blended_probability = blend_model_and_elo_probability(
+        model_probability=model_probability,
+        elo_probability=elo_probability,
+        model_bundle=model_bundle,
+    )
+
+    if model_trained_with_historical_injuries(model_bundle):
+        final_probability = blended_probability
+    else:
+        final_probability = apply_team_adjustments(
+            probability=blended_probability,
+            home_team=home_team,
+            away_team=away_team,
+            team_adjustments=team_adjustments,
+        )
+
+    return {
+        "model_probability": model_probability,
+        "elo_probability": elo_probability,
+        "blended_probability": blended_probability,
+        "final_probability": final_probability,
+    }
+
+
+def build_scenario_feature_overrides(
+    home_team: str,
+    away_team: str,
+    team_adjustments: dict[str, float] | None,
+    playoff_context: dict[str, float] | None,
+    home_rest_delta: int = 0,
+    away_rest_delta: int = 0,
+    home_back_to_back: bool = False,
+    away_back_to_back: bool = False,
+    neutral_site: bool = False,
+) -> dict[str, float]:
+    """Build model feature overrides from Prediction Lab controls."""
+    model_bundle = load_model_bundle()
+    strength = load_team_strength()
+    feature_columns = model_bundle["feature_columns"]
+    base_row = build_prediction_row_from_strength(
+        home_team=home_team,
+        away_team=away_team,
+        strength=strength,
+        feature_columns=feature_columns,
+        playoff_context=playoff_context,
+        team_adjustments=team_adjustments,
+    )
+    overrides: dict[str, float] = {}
+
+    if "DIFF_DAYS_REST" in base_row.columns:
+        overrides["DIFF_DAYS_REST"] = (
+            float(base_row.loc[0, "DIFF_DAYS_REST"])
+            + float(home_rest_delta - away_rest_delta)
+        )
+
+    if "DIFF_IS_BACK_TO_BACK" in base_row.columns and (home_back_to_back or away_back_to_back):
+        overrides["DIFF_IS_BACK_TO_BACK"] = float(
+            int(home_back_to_back) - int(away_back_to_back)
+        )
+
+    if "DIFF_IS_THIRD_IN_FOUR_DAYS" in base_row.columns and (home_back_to_back or away_back_to_back):
+        overrides["DIFF_IS_THIRD_IN_FOUR_DAYS"] = float(
+            int(home_back_to_back and home_rest_delta < 0)
+            - int(away_back_to_back and away_rest_delta < 0)
+        )
+
+    if "DIFF_GAMES_LAST_7_DAYS" in base_row.columns:
+        overrides["DIFF_GAMES_LAST_7_DAYS"] = (
+            float(base_row.loc[0, "DIFF_GAMES_LAST_7_DAYS"])
+            + float(int(home_back_to_back) - int(away_back_to_back))
+        )
+
+    if neutral_site and "HOME_ELO_WIN_PROB" in base_row.columns:
+        home_strength = get_team_strength_row(home_team, strength)
+        away_strength = get_team_strength_row(away_team, strength)
+        overrides["HOME_ELO_WIN_PROB"] = expected_score(
+            float(home_strength["ELO"]),
+            float(away_strength["ELO"]),
+        )
+
+    return overrides
+
+
+def get_selected_player_impacts(team_name: str, player_names: list[str]) -> float:
+    """Return summed impact score for selected players."""
+    if not player_names:
+        return 0.0
+
+    players = get_players_for_team(team_name)
+    selected = players[players["PLAYER_NAME"].isin(player_names)]
+    if selected.empty:
+        return 0.0
+
+    return float(selected["IMPACT_SCORE"].sum())
+
+
+def render_prediction_lab(
+    home_team: str,
+    away_team: str,
+    base_home_probability: float,
+    team_adjustments: dict[str, float],
+    playoff_context: dict[str, float] | None,
+    key_prefix: str,
+) -> None:
+    """Render what-if controls and scenario probability shifts."""
+    with st.expander("Prediction Lab", expanded=True):
+        control_cols = st.columns(2, gap="medium")
+        home_players = get_players_for_team(home_team).head(8)
+        away_players = get_players_for_team(away_team).head(8)
+
+        with control_cols[0]:
+            neutral_site = st.checkbox(
+                "Neutral site",
+                key=f"{key_prefix}_lab_neutral_site",
+            )
+            home_rest_delta = st.slider(
+                f"{home_team} rest adjustment",
+                min_value=-3,
+                max_value=3,
+                value=0,
+                step=1,
+                key=f"{key_prefix}_lab_home_rest",
+            )
+            home_back_to_back = st.checkbox(
+                f"{home_team} on back-to-back",
+                key=f"{key_prefix}_lab_home_b2b",
+            )
+            home_unavailable = st.multiselect(
+                f"{home_team} additional unavailable",
+                home_players["PLAYER_NAME"].tolist(),
+                key=f"{key_prefix}_lab_home_unavailable",
+            )
+
+        with control_cols[1]:
+            away_rest_delta = st.slider(
+                f"{away_team} rest adjustment",
+                min_value=-3,
+                max_value=3,
+                value=0,
+                step=1,
+                key=f"{key_prefix}_lab_away_rest",
+            )
+            away_back_to_back = st.checkbox(
+                f"{away_team} on back-to-back",
+                key=f"{key_prefix}_lab_away_b2b",
+            )
+            away_unavailable = st.multiselect(
+                f"{away_team} additional unavailable",
+                away_players["PLAYER_NAME"].tolist(),
+                key=f"{key_prefix}_lab_away_unavailable",
+            )
+
+        scenario_adjustments = dict(team_adjustments or {})
+        scenario_adjustments[home_team] = scenario_adjustments.get(home_team, 0.0) - get_selected_player_impacts(
+            home_team,
+            home_unavailable,
+        )
+        scenario_adjustments[away_team] = scenario_adjustments.get(away_team, 0.0) - get_selected_player_impacts(
+            away_team,
+            away_unavailable,
+        )
+        feature_overrides = build_scenario_feature_overrides(
+            home_team=home_team,
+            away_team=away_team,
+            team_adjustments=scenario_adjustments,
+            playoff_context=playoff_context,
+            home_rest_delta=int(home_rest_delta),
+            away_rest_delta=int(away_rest_delta),
+            home_back_to_back=bool(home_back_to_back),
+            away_back_to_back=bool(away_back_to_back),
+            neutral_site=bool(neutral_site),
+        )
+        strength = load_team_strength()
+        model_bundle = load_model_bundle()
+        scenario_details = predict_game_probability_details_with_feature_overrides(
+            home_team=home_team,
+            away_team=away_team,
+            strength=strength,
+            model_bundle=model_bundle,
+            team_adjustments=scenario_adjustments,
+            playoff_context=playoff_context,
+            feature_overrides=feature_overrides,
+            home_elo_advantage=0.0 if neutral_site else HOME_ELO_ADVANTAGE,
+        )
+        scenario_home_probability = float(scenario_details["final_probability"])
+        scenario_away_probability = 1 - scenario_home_probability
+        scenario_winner = (
+            home_team if scenario_home_probability >= scenario_away_probability else away_team
+        )
+        scenario_winner_probability = max(
+            scenario_home_probability,
+            scenario_away_probability,
+        )
+        shift = scenario_home_probability - float(base_home_probability)
+
+        render_prediction_result_card(
+            label="Scenario result",
+            winner=scenario_winner,
+            probability=scenario_winner_probability,
+            confidence=get_game_confidence_label(scenario_winner_probability),
+            details=scenario_details,
+            context="game",
+            note=f"{format_probability_shift(shift)} home-team shift from baseline",
+        )
+        render_dashboard_cards(
+            [
+                {
+                    "label": f"{home_team} baseline",
+                    "value": f"{base_home_probability:.0%}",
+                    "note": "Original home win chance",
+                    "color": get_team_color(home_team),
+                },
+                {
+                    "label": f"{home_team} scenario",
+                    "value": f"{scenario_home_probability:.0%}",
+                    "note": format_probability_shift(shift),
+                    "color": get_team_color(home_team),
+                },
+                {
+                    "label": f"{away_team} scenario",
+                    "value": f"{scenario_away_probability:.0%}",
+                    "note": format_probability_shift(-shift),
+                    "color": get_team_color(away_team),
+                },
+                {
+                    "label": "Changed inputs",
+                    "value": str(
+                        sum(
+                            [
+                                bool(neutral_site),
+                                home_rest_delta != 0,
+                                away_rest_delta != 0,
+                                bool(home_back_to_back),
+                                bool(away_back_to_back),
+                                bool(home_unavailable),
+                                bool(away_unavailable),
+                            ]
+                        )
+                    ),
+                    "note": "Scenario controls active",
+                    "color": "#7c3aed",
+                },
+            ]
+        )
+
+
+def get_team_signal_values(team_name: str) -> dict[str, float]:
+    """Return compact team metrics used by narrative features."""
+    strength = load_team_strength()
+    row = get_team_strength_row(team_name, strength)
+
+    def safe_float(column: str, default: float = 0.0) -> float:
+        value = row.get(column, default)
+        return default if pd.isna(value) else float(value)
+
+    return {
+        "rest": safe_float("DAYS_REST"),
+        "recent_net": safe_float("ROLLING_NET_RATING_10"),
+        "season_net": safe_float("SEASON_AVG_NET_RATING"),
+        "offense": safe_float("SEASON_AVG_OFF_RATING"),
+        "defense": safe_float("SEASON_AVG_DEF_RATING"),
+        "top8": safe_float("PLAYER_TOP_8"),
+        "pace": safe_float("SEASON_AVG_PACE", safe_float("ROLLING_PACE_10")),
+    }
+
+
+def build_underdog_path_rows(
+    home_team: str,
+    away_team: str,
+    home_probability: float,
+    team_adjustments: dict[str, float] | None = None,
+    playoff_context: dict[str, float] | None = None,
+) -> list[dict[str, str]]:
+    """Build a plain-English path for the underdog to win."""
+    away_probability = 1 - home_probability
+    underdog = home_team if home_probability < away_probability else away_team
+    favorite = away_team if underdog == home_team else home_team
+    underdog_probability = min(home_probability, away_probability)
+    underdog_values = get_team_signal_values(underdog)
+    favorite_values = get_team_signal_values(favorite)
+    snapshot = build_matchup_feature_snapshot(
+        home_team=home_team,
+        away_team=away_team,
+        team_adjustments=team_adjustments,
+        playoff_context=playoff_context,
+    )
+    injury_diff = float(snapshot["injury_features"]["DIFF_INJURY_WEIGHTED_IMPACT"])
+    underdog_missing_more = (
+        injury_diff > 0 if underdog == home_team else injury_diff < 0
+    )
+    rows = []
+
+    if underdog_values["recent_net"] < favorite_values["recent_net"]:
+        rows.append(
+            {
+                "Lever": "Flip the recent-form gap",
+                "Need": (
+                    f"Outplay the favorite's last-10 net rating edge "
+                    f"({favorite_values['recent_net'] - underdog_values['recent_net']:.1f})."
+                ),
+            }
+        )
+
+    if underdog_values["top8"] < favorite_values["top8"]:
+        rows.append(
+            {
+                "Lever": "Top-end minutes have to win",
+                "Need": (
+                    f"Close a {favorite_values['top8'] - underdog_values['top8']:.1f} "
+                    "rotation-impact gap with star scoring or bench minutes."
+                ),
+            }
+        )
+
+    if underdog_values["rest"] < favorite_values["rest"]:
+        rows.append(
+            {
+                "Lever": "Protect the tired stretches",
+                "Need": (
+                    f"Handle a {favorite_values['rest'] - underdog_values['rest']:.0f}-day "
+                    "rest disadvantage without losing the middle quarters."
+                ),
+            }
+        )
+
+    if underdog_missing_more:
+        rows.append(
+            {
+                "Lever": "Cover availability loss",
+                "Need": "Replacement minutes need to keep the game close enough for variance.",
+            }
+        )
+
+    if underdog_values["defense"] > favorite_values["defense"]:
+        rows.append(
+            {
+                "Lever": "Win the shot-quality battle",
+                "Need": "The underdog defense grades worse, so turnovers and transition defense matter more.",
+            }
+        )
+
+    rows.append(
+        {
+            "Lever": "Keep it within two possessions late",
+            "Need": (
+                f"The model still gives {underdog} a {underdog_probability:.0%} path; "
+                "late-game variance is the cleanest route."
+            ),
+        }
+    )
+
+    return rows[:4]
+
+
+def render_underdog_path(
+    home_team: str,
+    away_team: str,
+    home_probability: float,
+    team_adjustments: dict[str, float] | None = None,
+    playoff_context: dict[str, float] | None = None,
+) -> None:
+    """Render the underdog's best route to an upset."""
+    away_probability = 1 - home_probability
+    underdog = home_team if home_probability < away_probability else away_team
+    underdog_probability = min(home_probability, away_probability)
+    rows = build_underdog_path_rows(
+        home_team=home_team,
+        away_team=away_team,
+        home_probability=home_probability,
+        team_adjustments=team_adjustments,
+        playoff_context=playoff_context,
+    )
+    row_html = "".join(
+        f"""
+        <div class="player-row">
+            <div class="team-mini-score">{index}</div>
+            <div>
+                <div class="player-name">{html.escape(row["Lever"])}</div>
+                <div class="player-meta">{html.escape(row["Need"])}</div>
+            </div>
+            <div class="impact-score">{underdog_probability:.0%}</div>
+        </div>
+        """
+        for index, row in enumerate(rows, start=1)
+    )
+    render_section_kicker("How the underdog wins", f"{underdog} upset path")
+    st.html(row_html)
+
+
+def find_calibration_row(home_probability: float) -> pd.Series | None:
+    """Find the nearest saved calibration bucket for a home probability."""
+    calibration = load_calibration_metrics()
+    if calibration.empty or "Average_Predicted_Probability" not in calibration.columns:
+        return None
+
+    rows = calibration.copy()
+    rows["Distance"] = (
+        rows["Average_Predicted_Probability"].astype(float) - float(home_probability)
+    ).abs()
+    return rows.sort_values("Distance").iloc[0]
+
+
+def render_prediction_trust_meter(
+    home_probability: float,
+    winner_probability: float,
+) -> None:
+    """Render a local trust score using calibration and backtest data."""
+    calibration_row = find_calibration_row(home_probability)
+    backtests = load_backtest_metrics()
+    latest_backtest = None
+
+    if not backtests.empty and "Accuracy" in backtests.columns:
+        latest_backtest = backtests.sort_values("Test_Season").iloc[-1]
+
+    calibration_gap = None
+    bucket_label = "No bucket"
+    bucket_actual = "Unavailable"
+    bucket_games = "0"
+
+    if calibration_row is not None:
+        predicted = float(calibration_row["Average_Predicted_Probability"])
+        actual = float(calibration_row["Actual_Home_Win_Rate"])
+        calibration_gap = abs(predicted - actual)
+        bucket_label = str(calibration_row.get("Bucket", "Nearest bucket"))
+        bucket_actual = f"{actual:.0%}"
+        bucket_games = str(int(calibration_row.get("Games", 0)))
+
+    if calibration_gap is None:
+        trust_label = "Unknown"
+        trust_note = "Calibration data unavailable"
+    elif calibration_gap <= 0.035:
+        trust_label = "Well calibrated"
+        trust_note = f"{bucket_games} similar probability games"
+    elif calibration_gap <= 0.065:
+        trust_label = "Moderate"
+        trust_note = f"{bucket_games} similar probability games"
+    else:
+        trust_label = "Volatile"
+        trust_note = f"{bucket_games} similar probability games"
+
+    lower, upper, margin = estimate_prediction_interval(
+        winner_probability,
+        context="game",
+    )
+    backtest_value = (
+        f"{float(latest_backtest['Accuracy']):.0%}"
+        if latest_backtest is not None
+        else "Unavailable"
+    )
+    backtest_note = (
+        f"{latest_backtest['Test_Season']} backtest"
+        if latest_backtest is not None and "Test_Season" in latest_backtest
+        else "Latest rolling test"
+    )
+    render_section_kicker("Trust meter")
+    render_dashboard_cards(
+        [
+            {
+                "label": "Trust",
+                "value": trust_label,
+                "note": trust_note,
+                "color": "#0f766e",
+            },
+            {
+                "label": "Calibration",
+                "value": bucket_actual,
+                "note": bucket_label,
+                "color": "#2563eb",
+            },
+            {
+                "label": "Backtest",
+                "value": backtest_value,
+                "note": backtest_note,
+                "color": "#f97316",
+            },
+            {
+                "label": "Range",
+                "value": f"{lower:.0%}-{upper:.0%}",
+                "note": f"Approx. +/- {margin:.0%}",
+                "color": "#7c3aed",
+            },
+        ]
+    )
+
+
+def build_similar_historical_games(
+    home_team: str,
+    away_team: str,
+    team_adjustments: dict[str, float] | None = None,
+    playoff_context: dict[str, float] | None = None,
+    top_n: int = 6,
+) -> pd.DataFrame:
+    """Find historical games with similar model-feature profiles."""
+    try:
+        historical = load_model_features()
+        model_bundle = load_model_bundle()
+        strength = load_team_strength()
+    except Exception:
+        return pd.DataFrame()
+
+    feature_columns = [
+        column
+        for column in model_bundle.get("feature_columns", [])
+        if column in historical.columns
+    ]
+    if not feature_columns:
+        return pd.DataFrame()
+
+    current_row = build_prediction_row_from_strength(
+        home_team=home_team,
+        away_team=away_team,
+        strength=strength,
+        feature_columns=feature_columns,
+        playoff_context=playoff_context,
+        team_adjustments=team_adjustments,
+    )
+    historical_values = historical[feature_columns].astype(float).fillna(0.0)
+    current_values = current_row.iloc[0][feature_columns].astype(float).fillna(0.0)
+    stds = historical_values.std().replace(0, 1).fillna(1)
+    distances = (((historical_values - current_values) / stds) ** 2).mean(axis=1) ** 0.5
+    selected = historical.copy()
+    selected["Similarity Score"] = 1 / (1 + distances)
+    selected = selected.sort_values("Similarity Score", ascending=False).head(top_n)
+
+    rows = []
+    for _, row in selected.iterrows():
+        home_win = int(row.get("HOME_WIN", 0)) == 1
+        actual_winner = row["HOME_TEAM"] if home_win else row["AWAY_TEAM"]
+        rows.append(
+            {
+                "Date": format_status_timestamp(row.get("GAME_DATE")),
+                "Season": row.get("SEASON", ""),
+                "Matchup": f"{row['AWAY_TEAM']} at {row['HOME_TEAM']}",
+                "Actual Winner": actual_winner,
+                "Similarity": float(row["Similarity Score"]),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def render_similar_historical_games(
+    home_team: str,
+    away_team: str,
+    team_adjustments: dict[str, float] | None = None,
+    playoff_context: dict[str, float] | None = None,
+) -> None:
+    """Render similar historical games for evidence context."""
+    similar_games = build_similar_historical_games(
+        home_team=home_team,
+        away_team=away_team,
+        team_adjustments=team_adjustments,
+        playoff_context=playoff_context,
+    )
+    render_section_kicker("Similar historical games")
+
+    if similar_games.empty:
+        st.caption("No historical feature matches are available.")
+        return
+
+    display = similar_games.copy()
+    display["Similarity"] = display["Similarity"].map("{:.0%}".format)
+    st.dataframe(display, width="stretch", hide_index=True)
+
+
+def get_current_player_status_lookup(teams: list[str]) -> dict[tuple[str, str], str]:
+    """Return current injury-report status by normalized team/player."""
+    injuries = load_current_injuries()
+    if injuries.empty:
+        return {}
+
+    selected = injuries[injuries["TEAM"].isin(teams)].copy()
+    return {
+        (str(row["TEAM"]), normalize_name_for_matching(str(row["PLAYER_NAME"]))): str(
+            row.get("CURRENT_STATUS", "")
+        )
+        for _, row in selected.iterrows()
+    }
+
+
+def build_player_swing_rankings(
+    home_team: str,
+    away_team: str,
+    base_home_probability: float,
+    team_adjustments: dict[str, float] | None = None,
+    playoff_context: dict[str, float] | None = None,
+    limit_per_team: int = 6,
+) -> pd.DataFrame:
+    """Estimate which player availability changes move the matchup most."""
+    strength = load_team_strength()
+    model_bundle = load_model_bundle()
+    status_lookup = get_current_player_status_lookup([home_team, away_team])
+    rows = []
+
+    for team in [home_team, away_team]:
+        players = get_players_for_team(team).head(limit_per_team)
+
+        for _, player in players.iterrows():
+            player_name = str(player["PLAYER_NAME"])
+            impact = float(player["IMPACT_SCORE"])
+            scenario_adjustments = dict(team_adjustments or {})
+            scenario_adjustments[team] = scenario_adjustments.get(team, 0.0) - impact
+            scenario_details = predict_game_probability_details(
+                home_team=home_team,
+                away_team=away_team,
+                strength=strength,
+                model_bundle=model_bundle,
+                team_adjustments=scenario_adjustments,
+                playoff_context=playoff_context,
+            )
+            scenario_home_probability = float(scenario_details["final_probability"])
+            if team == home_team:
+                team_shift = scenario_home_probability - float(base_home_probability)
+            else:
+                team_shift = (
+                    (1 - scenario_home_probability)
+                    - (1 - float(base_home_probability))
+                )
+
+            rows.append(
+                {
+                    "Team": team,
+                    "Player": player_name,
+                    "Status": status_lookup.get(
+                        (team, normalize_name_for_matching(player_name)),
+                        "Active/Unlisted",
+                    ),
+                    "Impact": impact,
+                    "Team Win Shift If Unavailable": team_shift,
+                    "Game Swing": abs(scenario_home_probability - float(base_home_probability)),
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values("Game Swing", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+def render_player_swing_rankings(
+    home_team: str,
+    away_team: str,
+    base_home_probability: float,
+    team_adjustments: dict[str, float] | None = None,
+    playoff_context: dict[str, float] | None = None,
+) -> None:
+    """Render player availability swing rankings."""
+    swings = build_player_swing_rankings(
+        home_team=home_team,
+        away_team=away_team,
+        base_home_probability=base_home_probability,
+        team_adjustments=team_adjustments,
+        playoff_context=playoff_context,
+    )
+    render_section_kicker("Player swing rankings")
+
+    if swings.empty:
+        st.caption("Player swing rankings are unavailable.")
+        return
+
+    display = swings.head(8).copy()
+    display["Impact"] = display["Impact"].map("{:.1f}".format)
+    display["Team Win Shift If Unavailable"] = display[
+        "Team Win Shift If Unavailable"
+    ].map(format_probability_shift)
+    display["Game Swing"] = display["Game Swing"].map(lambda value: f"{value * 100:.1f} pts")
+    st.dataframe(display, width="stretch", hide_index=True)
+
+
+def parse_live_clock_remaining_minutes(clock: object) -> float | None:
+    """Parse a live clock value into minutes remaining in the period."""
+    formatted = format_live_clock(clock)
+    match = re.search(r"(\d+):(\d{2})", formatted)
+    if not match:
+        return None
+
+    return int(match.group(1)) + (int(match.group(2)) / 60)
+
+
+def estimate_live_home_probability(
+    pregame_home_probability: float,
+    home_score: object,
+    away_score: object,
+    period: object,
+    clock: object,
+) -> float | None:
+    """Estimate a lightweight live probability from score margin and game progress."""
+    try:
+        home_points = float(home_score)
+        away_points = float(away_score)
+    except (TypeError, ValueError):
+        return None
+
+    if home_points == 0 and away_points == 0:
+        return None
+
+    try:
+        period_number = int(float(period))
+    except (TypeError, ValueError):
+        period_number = 2
+
+    remaining = parse_live_clock_remaining_minutes(clock)
+    if remaining is None:
+        remaining = 0.0 if period_number >= 4 else 6.0
+
+    elapsed = ((max(period_number, 1) - 1) * 12) + max(0.0, 12 - remaining)
+    progress = min(max(elapsed / FULL_GAME_SIMULATION_MINUTES, 0.05), 1.0)
+    margin = home_points - away_points
+    score_weight = 0.035 + (0.105 * progress)
+    live_logit = probability_to_logit(pregame_home_probability) + (margin * score_weight)
+    return clamp_probability(logit_to_probability(live_logit))
+
+
+def build_live_probability_movement_html(game: pd.Series) -> str:
+    """Build a live probability movement note for current-game cards."""
+    home_score = normalize_score_value(game.get("Home Score", ""))
+    away_score = normalize_score_value(game.get("Away Score", ""))
+    if home_score == "" or away_score == "":
+        return ""
+
+    home_team = str(game["Home Team"])
+    away_team = str(game["Away Team"])
+    pregame_home_probability = float(game["Home Win Probability"])
+    live_home_probability = estimate_live_home_probability(
+        pregame_home_probability=pregame_home_probability,
+        home_score=home_score,
+        away_score=away_score,
+        period=game.get("Period", 0),
+        clock=game.get("Game Clock", ""),
+    )
+    if live_home_probability is None:
+        return ""
+
+    live_winner = home_team if live_home_probability >= 0.5 else away_team
+    shift = live_home_probability - pregame_home_probability
+    score_margin = float(home_score) - float(away_score)
+    margin_team = home_team if score_margin >= 0 else away_team
+    reason = (
+        f"{margin_team} leads by {abs(score_margin):.0f}"
+        if score_margin != 0
+        else "The score is tied"
+    )
+
+    return f"""
+        <div class="summary-box">
+            <div class="dashboard-label">Live probability movement</div>
+            <div class="result-meta">
+                Pregame home chance {pregame_home_probability:.0%} to live estimate
+                {live_home_probability:.0%} ({format_probability_shift(shift)}).
+                Current lean: {html.escape(live_winner)} because {html.escape(reason.lower())}.
+            </div>
+        </div>
+    """
+
+
+def build_upset_alert_rows(predictions: pd.DataFrame) -> pd.DataFrame:
+    """Rank current games by underdog upset potential."""
+    if predictions.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for _, game in predictions.iterrows():
+        home_team = str(game["Home Team"])
+        away_team = str(game["Away Team"])
+        home_probability = float(game["Home Win Probability"])
+        away_probability = 1 - home_probability
+        favorite = home_team if home_probability >= away_probability else away_team
+        underdog = away_team if favorite == home_team else home_team
+        underdog_probability = min(home_probability, away_probability)
+        home_values = get_team_signal_values(home_team)
+        away_values = get_team_signal_values(away_team)
+        snapshot = build_matchup_feature_snapshot(
+            home_team=home_team,
+            away_team=away_team,
+        )
+        injury_diff = float(snapshot["injury_features"]["DIFF_INJURY_WEIGHTED_IMPACT"])
+        vulnerabilities = []
+
+        if favorite == home_team:
+            if home_values["recent_net"] + 2 < away_values["recent_net"]:
+                vulnerabilities.append("favorite recent-form drag")
+            if home_values["rest"] < away_values["rest"]:
+                vulnerabilities.append("favorite rest disadvantage")
+            if injury_diff > 1:
+                vulnerabilities.append("favorite availability risk")
+        else:
+            if away_values["recent_net"] + 2 < home_values["recent_net"]:
+                vulnerabilities.append("favorite recent-form drag")
+            if away_values["rest"] < home_values["rest"]:
+                vulnerabilities.append("favorite rest disadvantage")
+            if injury_diff < -1:
+                vulnerabilities.append("favorite availability risk")
+
+        alert_score = underdog_probability + (0.035 * len(vulnerabilities))
+        rows.append(
+            {
+                "Game": f"{away_team} at {home_team}",
+                "Favorite": favorite,
+                "Underdog": underdog,
+                "Upset Chance": underdog_probability,
+                "Alert Score": alert_score,
+                "Why": ", ".join(vulnerabilities) or "price is close enough to monitor",
+            }
+        )
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values("Alert Score", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+def render_upset_alert_board(predictions: pd.DataFrame) -> None:
+    """Render the Today page's upset board."""
+    alerts = build_upset_alert_rows(predictions)
+    render_section_kicker("Upset alert board")
+
+    if alerts.empty:
+        st.caption("No upset alerts are available for this slate.")
+        return
+
+    display = alerts.head(5).copy()
+    display["Upset Chance"] = display["Upset Chance"].map("{:.0%}".format)
+    display["Alert Score"] = display["Alert Score"].map("{:.2f}".format)
+    st.dataframe(display, width="stretch", hide_index=True)
+
+
 def build_today_game_predictions(games: pd.DataFrame) -> pd.DataFrame:
     """Predict all currently scheduled games that can be mapped to local teams."""
     if games.empty:
@@ -4515,6 +6407,35 @@ def build_today_game_predictions(games: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_today_prediction_summary_html(
+    winner: str,
+    winner_probability: float,
+    confidence: object,
+    home_team: str,
+    home_probability: float,
+) -> str:
+    """Build a consistent prediction summary for current-game cards."""
+    return f"""
+        <div class="today-prediction-grid">
+            <div class="today-prediction-cell">
+                <div class="today-prediction-label">Pick</div>
+                <div class="today-prediction-value">{html.escape(winner)}</div>
+                <div class="today-prediction-note">{winner_probability:.0%} win chance</div>
+            </div>
+            <div class="today-prediction-cell">
+                <div class="today-prediction-label">Confidence</div>
+                <div class="today-prediction-value">{html.escape(str(confidence))}</div>
+                <div class="today-prediction-note">Model signal</div>
+            </div>
+            <div class="today-prediction-cell">
+                <div class="today-prediction-label">Home team chance</div>
+                <div class="today-prediction-value">{home_probability:.0%}</div>
+                <div class="today-prediction-note">Chance {html.escape(home_team)} wins</div>
+            </div>
+        </div>
+    """
+
+
 def render_today_game_card(game: pd.Series, compact: bool = False) -> None:
     """Render one current-game card with score and prediction."""
     home_team = str(game["Home Team"])
@@ -4528,28 +6449,87 @@ def render_today_game_card(game: pd.Series, compact: bool = False) -> None:
     home_score = game.get("Home Score", "")
     away_score = game.get("Away Score", "")
     team_color = get_team_color(winner)
+    live_game_id = str(game.get("Game ID", "")).strip()
 
     def format_score(value: object) -> str:
         if value is None or pd.isna(value) or str(value) == "":
             return ""
-        return str(value)
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return str(value)
 
-    score_html = ""
+        if numeric.is_integer():
+            return str(int(numeric))
+
+        return str(numeric)
+
     home_score_text = format_score(home_score)
     away_score_text = format_score(away_score)
     timing = build_today_game_timing_state(game)
     live_state, _ = build_live_game_state(game)
+    movement_game = game.copy()
 
-    if home_score_text or away_score_text:
-        score_html = (
-            f'<div class="today-score">{html.escape(away_score_text)} - '
-            f'{html.escape(home_score_text)}</div>'
+    live_snapshot = resolve_live_today_snapshot(live_game_id, home_team, away_team)
+    if live_snapshot is not None:
+        live_home = format_score(live_snapshot.get("Home Score", home_score_text))
+        live_away = format_score(live_snapshot.get("Away Score", away_score_text))
+        live_label = str(live_snapshot.get("Status", "")).strip()
+        live_detail = build_live_detail_label(
+            live_label,
+            live_snapshot.get("Period"),
+            live_snapshot.get("Game Clock"),
         )
+        live_score_present = bool(live_home or live_away)
+        live_time_present = bool(live_detail)
+        for column in ["Home Score", "Away Score", "Period", "Game Clock", "Status"]:
+            if column in live_snapshot:
+                movement_game[column] = live_snapshot.get(column)
+
+        if live_score_present:
+            home_score_text = live_home or home_score_text
+            away_score_text = live_away or away_score_text
+
+        if "final" in live_label.lower():
+            timing = {
+                "mode": "final",
+                "badge": "FINAL",
+                "detail": "",
+                "status": "Final",
+                "refresh": "0",
+            }
+        elif live_score_present or live_time_present:
+            live_state = live_detail or live_state or "Live"
+            timing = {
+                "mode": "live",
+                "badge": "LIVE",
+                "detail": live_state,
+                "status": "Live",
+                "refresh": "15",
+            }
+
+    away_score_html = (
+        f'<div class="today-team-score">{html.escape(away_score_text)}</div>'
+        if away_score_text
+        else ""
+    )
+    home_score_html = (
+        f'<div class="today-team-score">{html.escape(home_score_text)}</div>'
+        if home_score_text
+        else ""
+    )
 
     context_note = "Playoff context included" if bool(game.get("Playoff Context")) else source
-    probability_label = "Pick" if compact else "Model Pick"
     reason_html = ""
     timing_html = ""
+    play_html = ""
+    prediction_summary_html = build_today_prediction_summary_html(
+        winner=winner,
+        winner_probability=winner_probability,
+        confidence=game["Confidence"],
+        home_team=home_team,
+        home_probability=float(game["Home Win Probability"]),
+    )
 
     if prediction_note and prediction_note.lower() != "nan":
         reason_html = f'<div class="dashboard-note">{html.escape(prediction_note)}</div>'
@@ -4570,6 +6550,23 @@ def render_today_game_card(game: pd.Series, compact: bool = False) -> None:
             '</div>'
         )
 
+    espn_game_id_value = game.get("ESPN Game ID", "")
+    espn_game_id = (
+        ""
+        if espn_game_id_value is None or pd.isna(espn_game_id_value)
+        else str(espn_game_id_value).strip()
+    )
+
+    if timing["mode"] == "live" and espn_game_id:
+        latest_play_line = format_latest_play_line(load_espn_latest_play(espn_game_id))
+
+        if latest_play_line:
+            play_html = (
+                f'<div class="today-play-line">{html.escape(latest_play_line)}</div>'
+            )
+
+    live_probability_html = build_live_probability_movement_html(movement_game)
+
     st.html(
         f"""
         <div class="today-card" style="--team-color: {html.escape(team_color)};">
@@ -4587,26 +6584,25 @@ def render_today_game_card(game: pd.Series, compact: bool = False) -> None:
                     <img class="today-logo" src="{html.escape(get_logo_url(away_team))}" alt="{html.escape(away_team)} logo">
                     <div>
                         <div class="today-name">{html.escape(away_team)}</div>
+                        {away_score_html}
                         <div class="team-mini-meta">Away</div>
                     </div>
                 </div>
                 <div>
                     <div class="today-vs">AT</div>
-                    {score_html}
                 </div>
                 <div class="today-team">
                     <div>
                         <div class="today-name">{html.escape(home_team)}</div>
+                        {home_score_html}
                         <div class="team-mini-meta">Home</div>
                     </div>
                     <img class="today-logo" src="{html.escape(get_logo_url(home_team))}" alt="{html.escape(home_team)} logo">
                 </div>
             </div>
-            <div class="signal-grid">
-                <span class="signal-pill">{html.escape(probability_label)}: {html.escape(winner)} {winner_probability:.0%}</span>
-                <span class="signal-pill">{html.escape(str(game["Confidence"]))}</span>
-                <span class="signal-pill">Home {float(game["Home Win Probability"]):.0%}</span>
-            </div>
+            {play_html}
+            {prediction_summary_html}
+            {live_probability_html}
         </div>
         """
     )
@@ -4890,6 +6886,13 @@ def render_today_game_breakdown_card(game: pd.Series) -> None:
     status = str(timing.get("status", "Scheduled"))
     winner = str(game["Predicted Winner"])
     winner_probability = float(game["Winner Probability"])
+    prediction_summary_html = build_today_prediction_summary_html(
+        winner=winner,
+        winner_probability=winner_probability,
+        confidence=game["Confidence"],
+        home_team=home_team,
+        home_probability=float(game["Home Win Probability"]),
+    )
 
     st.html(
         f"""
@@ -4914,12 +6917,35 @@ def render_today_game_breakdown_card(game: pd.Series) -> None:
 
     st.html(
         f"""
-        <div class="signal-grid">
-            <span class="signal-pill">Pick: {html.escape(winner)} {winner_probability:.0%}</span>
-            <span class="signal-pill">{html.escape(str(game["Confidence"]))}</span>
-            <span class="signal-pill">Home {float(game["Home Win Probability"]):.0%}</span>
-        </div>
+        {prediction_summary_html}
         """
+    )
+    movement_html = build_live_probability_movement_html(game)
+    if movement_html:
+        st.html(movement_html)
+
+    team_adjustments, _ = build_official_availability_adjustments([home_team, away_team])
+    playoff_context = infer_current_playoff_context_for_matchup(
+        home_team=home_team,
+        away_team=away_team,
+    )
+    render_prediction_trust_meter(
+        home_probability=float(game["Home Win Probability"]),
+        winner_probability=winner_probability,
+    )
+    render_section_kicker("Prediction factors")
+    render_matchup_signal_cards(
+        home_team=home_team,
+        away_team=away_team,
+        team_adjustments=team_adjustments,
+        playoff_context=playoff_context,
+    )
+    render_underdog_path(
+        home_team=home_team,
+        away_team=away_team,
+        home_probability=float(game["Home Win Probability"]),
+        team_adjustments=team_adjustments,
+        playoff_context=playoff_context,
     )
 
 
@@ -4944,6 +6970,34 @@ def render_today_game_breakdown_selector(games: pd.DataFrame) -> None:
     timing = build_today_game_timing_state(selected_game)
     st.caption(str(timing.get("detail", "")) or str(selected_game.get("Game Time", "")))
     render_today_game_breakdown_card(selected_game)
+
+
+@st.fragment(run_every=1)
+def render_today_game_breakdown_live_fragment() -> None:
+    """Render the current-game breakdown from the same live source as the cards."""
+    games = load_today_games()
+    is_upcoming_slate = False
+
+    if games.empty:
+        games = load_next_upcoming_games()
+        is_upcoming_slate = True
+
+        if games.empty:
+            st.info("No current or upcoming games are available from the free feeds.")
+            return
+
+    predictions = build_today_game_predictions(games)
+
+    if predictions.empty:
+        st.info("No current or upcoming games are available for prediction.")
+        return
+
+    if is_upcoming_slate:
+        render_section_kicker("Upcoming breakdown", format_game_slate_label(games) or None)
+    else:
+        render_section_kicker("Today breakdown")
+
+    render_today_game_breakdown_selector(predictions)
 
 
 def render_today_games_cards(games: pd.DataFrame, compact: bool = False) -> None:
@@ -6550,9 +8604,129 @@ def build_completed_playoff_game_results(season: str | None = None) -> pd.DataFr
     return results.sort_values(["GAME_DATE", "GAME_ID"]).reset_index(drop=True)
 
 
+def build_final_game_results_from_games(games: pd.DataFrame) -> pd.DataFrame:
+    """Build completed playoff result rows from normalized game rows."""
+    if games.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for _, game in games.iterrows():
+        status = str(game.get("Status", "")).strip().lower()
+        status_code = coerce_game_status_code(game.get("Game Status Code", 0))
+
+        if status_code < 3 and "final" not in status:
+            continue
+
+        home_team = str(game.get("Home Team", "")).strip()
+        away_team = str(game.get("Away Team", "")).strip()
+        home_points = normalize_score_value(game.get("Home Score", ""))
+        away_points = normalize_score_value(game.get("Away Score", ""))
+
+        if not home_team or not away_team or home_points == "" or away_points == "":
+            continue
+
+        if not is_known_team_name(home_team) or not is_known_team_name(away_team):
+            continue
+
+        try:
+            home_points = int(float(home_points))
+            away_points = int(float(away_points))
+        except (TypeError, ValueError):
+            continue
+
+        if home_points == away_points:
+            continue
+
+        game_date_value = game.get("Game Date")
+
+        if game_date_value is None or pd.isna(game_date_value):
+            game_date_value = game.get("Game DateTime")
+
+        game_date = pd.to_datetime(game_date_value, errors="coerce")
+
+        if pd.isna(game_date):
+            game_date = pd.Timestamp.now(tz=ZoneInfo("America/New_York")).normalize()
+
+        winner = home_team if home_points > away_points else away_team
+        loser = away_team if winner == home_team else home_team
+
+        rows.append(
+            {
+                "GAME_ID": str(game.get("Game ID", "")).strip()
+                or str(game.get("ESPN Game ID", "")).strip(),
+                "GAME_DATE": game_date,
+                "Home Team": home_team,
+                "Home Points": home_points,
+                "Home Result": "W" if winner == home_team else "L",
+                "Away Team": away_team,
+                "Away Points": away_points,
+                "Winner": winner,
+                "Loser": loser,
+                "Series Key": " vs ".join(sorted([home_team, away_team])),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
+
+def build_live_final_game_results() -> pd.DataFrame:
+    """Build completed game result rows from today's live feed before local refresh."""
+    try:
+        games = load_today_games()
+    except Exception:
+        return pd.DataFrame()
+
+    return build_final_game_results_from_games(games)
+
+
+def build_schedule_final_game_results(season: str | None = None) -> pd.DataFrame:
+    """Build completed game result rows from the NBA schedule feed."""
+    try:
+        games = load_nba_schedule_games(season)
+    except Exception:
+        return pd.DataFrame()
+
+    games = filter_schedule_playoff_rows(games)
+    return build_final_game_results_from_games(games)
+
+
+def normalize_game_id_for_merge(value: object) -> str:
+    """Normalize NBA game IDs across feeds that disagree on leading zeroes."""
+    text = str(value).strip()
+    normalized = text.lstrip("0")
+    return normalized or text
+
+
+def build_completed_playoff_game_results_with_live(
+    season: str | None = None,
+) -> pd.DataFrame:
+    """Return completed playoff results plus schedule/live finals not yet collected."""
+    results = build_completed_playoff_game_results(season)
+    schedule_results = build_schedule_final_game_results(season)
+    live_results = build_live_final_game_results()
+    frames = [
+        frame
+        for frame in [results, schedule_results, live_results]
+        if not frame.empty
+    ]
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined["GAME_ID_MERGE_KEY"] = combined["GAME_ID"].map(normalize_game_id_for_merge)
+    combined = combined.drop_duplicates(subset=["GAME_ID_MERGE_KEY"], keep="first")
+    combined = combined.drop(columns=["GAME_ID_MERGE_KEY"])
+    return combined.sort_values(["GAME_DATE", "GAME_ID"]).reset_index(drop=True)
+
+
 def build_current_playoff_series_states(season: str | None = None) -> list[dict]:
     """Build current playoff series states from completed game logs."""
-    results = build_completed_playoff_game_results(season)
+    results = build_completed_playoff_game_results_with_live(season)
 
     if results.empty:
         return []
@@ -7019,6 +9193,149 @@ def simulate_remaining_current_series(
     }
 
 
+def build_series_state_for_matchup(
+    higher_seed_team: str,
+    lower_seed_team: str,
+) -> dict:
+    """Create a clean 0-0 series state for the momentum map."""
+    return {
+        "series_key": " vs ".join(sorted([higher_seed_team, lower_seed_team])),
+        "home_court_team": higher_seed_team,
+        "other_team": lower_seed_team,
+        "teams": [higher_seed_team, lower_seed_team],
+        "wins": {higher_seed_team: 0, lower_seed_team: 0},
+        "leader": higher_seed_team,
+        "games_played": 0,
+        "next_game_number": 1,
+        "completed": False,
+        "game_rows": [],
+        "last_winner": None,
+        "current_streak": 0,
+    }
+
+
+def build_hypothetical_series_state_after_next_game(
+    series_state: dict,
+    winner: str,
+) -> dict:
+    """Advance a series state by one hypothetical next-game result."""
+    wins = dict(series_state["wins"])
+    wins[winner] = wins.get(winner, 0) + 1
+    teams = list(series_state["teams"])
+    leader = max(teams, key=lambda team: wins.get(team, 0))
+    next_game_number = int(series_state["next_game_number"]) + 1
+    completed = wins[winner] >= 4
+
+    return {
+        **series_state,
+        "wins": wins,
+        "leader": leader,
+        "games_played": int(series_state["games_played"]) + 1,
+        "next_game_number": next_game_number,
+        "completed": completed,
+        "last_winner": winner,
+        "current_streak": (
+            int(series_state.get("current_streak", 0)) + 1
+            if series_state.get("last_winner") == winner
+            else 1
+        ),
+    }
+
+
+def build_series_next_game_swing_rows(
+    series_state: dict,
+    team_adjustments: dict[str, float] | None,
+    simulations: int,
+    seed: int,
+) -> pd.DataFrame:
+    """Show how the series probabilities change after each possible next result."""
+    if series_state.get("completed") or int(series_state["next_game_number"]) > 7:
+        return pd.DataFrame()
+
+    teams = list(series_state["teams"])
+    base_results = simulate_remaining_current_series(
+        series_state=series_state,
+        simulations=simulations,
+        seed=seed,
+        team_adjustments=team_adjustments,
+    )
+    base_probabilities = base_results["series_probabilities"]
+    next_game_number = int(series_state["next_game_number"])
+    next_home_team = get_scheduled_home_team_for_series_game(
+        series_state["home_court_team"],
+        series_state["other_team"],
+        next_game_number,
+    )
+    next_away_team = (
+        series_state["other_team"]
+        if next_home_team == series_state["home_court_team"]
+        else series_state["home_court_team"]
+    )
+    rows = []
+
+    for hypothetical_winner in [next_home_team, next_away_team]:
+        hypothetical_state = build_hypothetical_series_state_after_next_game(
+            series_state,
+            hypothetical_winner,
+        )
+
+        if hypothetical_state["completed"]:
+            probabilities = {
+                team: 1.0 if team == hypothetical_winner else 0.0
+                for team in teams
+            }
+        else:
+            results = simulate_remaining_current_series(
+                series_state=hypothetical_state,
+                simulations=simulations,
+                seed=seed + next_game_number,
+                team_adjustments=team_adjustments,
+            )
+            probabilities = results["series_probabilities"]
+
+        favorite = max(probabilities, key=probabilities.get)
+        swing_team = hypothetical_winner
+        rows.append(
+            {
+                "Scenario": f"If {hypothetical_winner} wins Game {next_game_number}",
+                teams[0]: probabilities.get(teams[0], 0.0),
+                teams[1]: probabilities.get(teams[1], 0.0),
+                "Projected Leader": favorite,
+                "Swing": probabilities.get(swing_team, 0.0)
+                - base_probabilities.get(swing_team, 0.0),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def render_series_momentum_map(
+    series_state: dict,
+    team_adjustments: dict[str, float] | None,
+    simulations: int,
+    seed: int,
+) -> None:
+    """Render next-game series leverage."""
+    swing_rows = build_series_next_game_swing_rows(
+        series_state=series_state,
+        team_adjustments=team_adjustments,
+        simulations=simulations,
+        seed=seed,
+    )
+    render_section_kicker("Series momentum map")
+
+    if swing_rows.empty:
+        st.caption("No next-game series swing is available.")
+        return
+
+    display = swing_rows.copy()
+    for team in series_state["teams"]:
+        if team in display.columns:
+            display[team] = display[team].map("{:.0%}".format)
+    display["Swing"] = display["Swing"].map(format_probability_shift)
+    st.dataframe(display, width="stretch", hide_index=True)
+
+
 def infer_current_playoff_context_for_matchup(
     home_team: str,
     away_team: str,
@@ -7448,7 +9765,12 @@ def build_active_series_projection_rows(
 ) -> list[dict]:
     """Build compact current-series projections for dashboard cards."""
     series_states = build_current_playoff_series_states()
-    active_states = [state for state in series_states if not state["completed"]]
+    active_states = [
+        state
+        for state in series_states
+        if not state["completed"]
+        and all(is_known_team_name(team) for team in state["teams"])
+    ]
 
     if not active_states:
         return []
@@ -7520,6 +9842,41 @@ def build_active_series_projection_rows(
     return rows
 
 
+def render_current_series_cards() -> None:
+    """Render compact current-series cards."""
+    series_projections = build_active_series_projection_rows()
+
+    if not series_projections:
+        return
+
+    render_section_kicker("Current Series")
+    columns = st.columns(min(2, len(series_projections)))
+
+    for index, projection in enumerate(series_projections):
+        next_game_line, remaining_games = build_remaining_series_lines(
+            next_winner=projection["next_winner"],
+            next_probability=projection["next_probability"],
+            schedule=projection["schedule"],
+        )
+
+        with columns[index % len(columns)]:
+            render_series_score_card(
+                projection["state"],
+                projection=(
+                    f"Series: {projection['projected_winner']} "
+                    f"{projection['series_probability']:.0%}"
+                ),
+                next_game=next_game_line,
+                remaining_games=remaining_games,
+            )
+
+
+@st.fragment(run_every=15)
+def render_current_series_live_fragment() -> None:
+    """Refresh current-series state after live games go final."""
+    render_current_series_cards()
+
+
 def render_power_snapshot(strength: pd.DataFrame, limit: int = 5) -> None:
     """Render a compact power ranking snapshot."""
     top_rows = strength.sort_values("ELO", ascending=False).head(limit)
@@ -7541,45 +9898,13 @@ def render_power_snapshot(strength: pd.DataFrame, limit: int = 5) -> None:
 def render_home_dashboard(teams: list[str]) -> None:
     """Render the first-screen dashboard."""
     st.header("Home")
-    render_refresh_controls()
-
-    strength = load_team_strength()
-    today_games = load_today_games()
-    today_predictions = build_today_game_predictions(today_games)
-    series_states = build_current_playoff_series_states()
 
     render_section_kicker("Today's Games")
     render_today_games_live_fragment(compact=True)
 
-    if not today_predictions.empty:
-        render_section_kicker("Today breakdown")
-        render_today_game_breakdown_selector(today_predictions)
-    else:
-        st.info("No current games are available from the free live feed or saved report.")
+    render_today_game_breakdown_live_fragment()
 
-    series_projections = build_active_series_projection_rows()
-
-    if series_projections:
-        render_section_kicker("Current Series")
-        columns = st.columns(min(2, len(series_projections)))
-
-        for index, projection in enumerate(series_projections):
-            next_game_line, remaining_games = build_remaining_series_lines(
-                next_winner=projection["next_winner"],
-                next_probability=projection["next_probability"],
-                schedule=projection["schedule"],
-            )
-
-            with columns[index % len(columns)]:
-                render_series_score_card(
-                    projection["state"],
-                    projection=(
-                        f"Series: {projection['projected_winner']} "
-                        f"{projection['series_probability']:.0%}"
-                    ),
-                    next_game=next_game_line,
-                    remaining_games=remaining_games,
-                )
+    render_current_series_live_fragment()
 
 
 def render_today_games_section(teams: list[str]) -> None:
@@ -8017,6 +10342,19 @@ def render_single_game_section(teams: list[str]) -> None:
             label="Win probability",
         )
 
+        render_prediction_trust_meter(
+            home_probability=float(prediction_state["home_probability"]),
+            winner_probability=float(prediction_state["winner_probability"]),
+        )
+
+        render_section_kicker("Prediction factors")
+        render_matchup_signal_cards(
+            home_team=home_team,
+            away_team=away_team,
+            team_adjustments=dict(prediction_state["team_adjustments"]),
+            playoff_context=playoff_context,
+        )
+
         render_game_score_simulation(
             home_team=home_team,
             away_team=away_team,
@@ -8024,6 +10362,38 @@ def render_single_game_section(teams: list[str]) -> None:
             team_adjustments=dict(prediction_state["team_adjustments"]),
             seed=int(prediction_state["seed"]),
             label="Projected score",
+        )
+
+        render_prediction_lab(
+            home_team=home_team,
+            away_team=away_team,
+            base_home_probability=float(prediction_state["home_probability"]),
+            team_adjustments=dict(prediction_state["team_adjustments"]),
+            playoff_context=playoff_context,
+            key_prefix="single_game",
+        )
+
+        render_underdog_path(
+            home_team=home_team,
+            away_team=away_team,
+            home_probability=float(prediction_state["home_probability"]),
+            team_adjustments=dict(prediction_state["team_adjustments"]),
+            playoff_context=playoff_context,
+        )
+
+        render_player_swing_rankings(
+            home_team=home_team,
+            away_team=away_team,
+            base_home_probability=float(prediction_state["home_probability"]),
+            team_adjustments=dict(prediction_state["team_adjustments"]),
+            playoff_context=playoff_context,
+        )
+
+        render_similar_historical_games(
+            home_team=home_team,
+            away_team=away_team,
+            team_adjustments=dict(prediction_state["team_adjustments"]),
+            playoff_context=playoff_context,
         )
 
         render_matchup_explanation(
@@ -8229,6 +10599,16 @@ def render_series_section(teams: list[str]) -> None:
             lower_seed_team=lower_seed_team,
         )
 
+        render_series_momentum_map(
+            series_state=build_series_state_for_matchup(
+                higher_seed_team=higher_seed_team,
+                lower_seed_team=lower_seed_team,
+            ),
+            team_adjustments=team_adjustments,
+            simulations=int(simulations),
+            seed=int(seed),
+        )
+
         render_matchup_explanation(
             team_a=higher_seed_team,
             team_b=lower_seed_team,
@@ -8297,8 +10677,13 @@ def render_current_playoff_series_section() -> None:
         st.warning("No playoff series data found. Run `python src/collect_data.py` first.")
         return
 
-    active_states = [state for state in series_states if not state["completed"]]
-    completed_states = [state for state in series_states if state["completed"]]
+    valid_series_states = [
+        state
+        for state in series_states
+        if all(is_known_team_name(team) for team in state["teams"])
+    ]
+    active_states = [state for state in valid_series_states if not state["completed"]]
+    completed_states = [state for state in valid_series_states if state["completed"]]
     active_teams = sorted(
         {
             team
@@ -8307,7 +10692,7 @@ def render_current_playoff_series_section() -> None:
         }
     )
 
-    total_games = sum(int(state["games_played"]) for state in series_states)
+    total_games = sum(int(state["games_played"]) for state in valid_series_states)
     st.caption(
         f"{len(active_states)} active series / "
         f"{len(completed_states)} complete / {total_games} games logged"
@@ -8489,6 +10874,13 @@ def render_current_playoff_series_section() -> None:
                             f"current_series_{state['series_key']}"
                             f"_{projection['next_game_number']}"
                         ),
+                    )
+
+                    render_series_momentum_map(
+                        series_state=state,
+                        team_adjustments=team_adjustments,
+                        simulations=int(simulations),
+                        seed=int(seed),
                     )
 
                     result_table = projection["results"]["result_table"].copy()
@@ -8778,7 +11170,6 @@ def render_team_strength_section() -> None:
 def render_model_info_section(teams: list[str]) -> None:
     """Render model metrics and limitations."""
     st.header("Model Info")
-    render_refresh_controls()
 
     bundle = load_model_bundle()
     model_name = str(bundle.get("model_name", "Unknown model"))
