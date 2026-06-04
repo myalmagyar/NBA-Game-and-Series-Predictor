@@ -65,6 +65,20 @@ HEADER_TOKENS = {
     "Reason",
 }
 
+INJURY_COLUMNS = [
+    "REPORT_TIMESTAMP",
+    "SOURCE_URL",
+    "GAME_DATE",
+    "GAME_TIME",
+    "MATCHUP",
+    "TEAM",
+    "PLAYER_NAME_REPORT",
+    "PLAYER_NAME",
+    "CURRENT_STATUS",
+    "STATUS_WEIGHT",
+    "REASON",
+]
+
 
 def fetch_url(url: str) -> bytes:
     """Fetch bytes from a URL with a browser-like user agent."""
@@ -355,7 +369,7 @@ def parse_injury_report_text(
 
         index += 1
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=INJURY_COLUMNS)
 
 
 def fetch_latest_injury_report() -> pd.DataFrame:
@@ -391,6 +405,7 @@ def build_current_injuries_file() -> pd.DataFrame:
     """Build the current injuries CSV used by the Streamlit app."""
     DATA_DIR.mkdir(exist_ok=True)
     injuries = fetch_latest_injury_report()
+    injuries = injuries.reindex(columns=INJURY_COLUMNS)
     injuries.to_csv(CURRENT_INJURIES_PATH, index=False)
 
     print(f"Saved {len(injuries)} injury rows to {CURRENT_INJURIES_PATH}")

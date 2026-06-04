@@ -2951,7 +2951,7 @@ def build_prediction_explanation(
         formatted = f"{edge:+.{digits}f}{suffix}" if digits else f"{edge:+.0f}{suffix}"
         reasons.append(f"{label} {formatted}")
 
-    add_numeric_edge("Elo edge", "ELO", 15, digits=0)
+    add_numeric_edge("Power rating edge", "ELO", 15, digits=0)
     add_numeric_edge("Run diff edge", "SEASON_RUN_DIFF_PER_GAME", 0.2, suffix="/G")
     add_numeric_edge("Last 10 form", "ROLLING_RUN_DIFF_10", 0.3)
 
@@ -2981,7 +2981,7 @@ def build_prediction_explanation(
         reasons.append("Home-field edge")
 
     if not reasons:
-        reasons.append("Model blend sees a narrow edge")
+        reasons.append("Pricing blend sees a narrow edge")
 
     return reasons[:4]
 
@@ -4774,9 +4774,9 @@ def render_prediction_result_card(
 
     if details:
         if "model_probability" in details:
-            signals.append(f"Model {float(details['model_probability']):.0%}")
+            signals.append(f"Win {float(details['model_probability']):.0%}")
         if "elo_probability" in details:
-            signals.append(f"Elo {float(details['elo_probability']):.0%}")
+            signals.append(f"Power {float(details['elo_probability']):.0%}")
 
     explanation = []
 
@@ -4810,7 +4810,7 @@ def render_prediction_result_card(
                 {logo_html}
                 <div>
                     <div class="prediction-winner">{html.escape(winner)}</div>
-                    <div class="prediction-sub">Projected win probability with model uncertainty</div>
+                    <div class="prediction-sub">Projected win probability with pricing confidence</div>
                     {note_html}
                 </div>
                 <div class="prediction-prob">{probability:.0%}</div>
@@ -4956,7 +4956,7 @@ def render_team_mini_rows(rows: list[dict]) -> None:
 def render_home_signal_cards(cards: list[dict]) -> None:
     """Render home-only signal cards."""
     if not cards:
-        st.info("No model signals are available for the current slate.")
+        st.info("No pick signals are available for the current slate.")
         return
 
     card_html = []
@@ -6570,7 +6570,7 @@ def render_game_card(game: pd.Series, live_snapshot: dict | None = None) -> None
     prediction_explanation = str(game.get("PREDICTION_EXPLANATION", "") or "").strip()
 
     if pd.isna(winner_probability):
-        prediction_html = '<div class="mlb-meta">Run the MLB data/model commands to enable predictions.</div>'
+        prediction_html = '<div class="mlb-meta">Run the MLB data refresh commands to enable picks.</div>'
     else:
         explanation_html = (
             f'<div class="prediction-explain">Why: {html.escape(prediction_explanation)}</div>'
@@ -7920,10 +7920,10 @@ def build_home_game_signals(games: pd.DataFrame) -> tuple[list[dict], pd.DataFra
             "color": "#7c3aed",
         },
         {
-            "label": "Model Watch",
+            "label": "Price Watch",
             "title": format_matchup(disagreement),
             "value": f"{float(disagreement['MODEL_ELO_GAP']):.0%}",
-            "note": "Largest model vs Elo gap",
+            "note": "Largest pricing disagreement",
             "color": "#b91c1c",
         },
     ]
@@ -8273,8 +8273,8 @@ def render_game_view() -> None:
                 f"{home_team}: {details['home_probability']:.1%}",
                 f"{away_team}: {details['away_probability']:.1%}",
                 f"Projected score: {away_team} {projection['projected_away_score']}, {home_team} {projection['projected_home_score']}",
-                f"Model probability: {details['model_probability']:.1%}",
-                f"Elo probability: {details['elo_probability']:.1%}",
+                f"Win chance: {details['model_probability']:.1%}",
+                f"Power rating chance: {details['elo_probability']:.1%}",
             ],
         )
         st.session_state[prediction_state_key] = {
@@ -8316,9 +8316,9 @@ def render_game_view() -> None:
             seed=int(prediction_state["projection_seed"]),
         )
 
-        with st.expander("Model details", expanded=False):
-            st.write(f"Model probability: {float(details['model_probability']):.1%}")
-            st.write(f"Elo probability: {float(details['elo_probability']):.1%}")
+        with st.expander("Pricing details", expanded=False):
+            st.write(f"Win chance: {float(details['model_probability']):.1%}")
+            st.write(f"Power rating chance: {float(details['elo_probability']):.1%}")
             st.write(f"Blended home probability: {float(details['home_probability']):.1%}")
             render_report_download(
                 report_text=str(prediction_state["report"]),
@@ -8864,15 +8864,15 @@ def simple_betting_signal(edge: object) -> tuple[str, str, str]:
         return "Add odds", "Enter or load a sportsbook price.", "edge-none"
 
     if parsed >= 0.05:
-        return "Good value", "The model likes this more than the book does.", "edge-strong"
+        return "Good value", "Our win chance is better than the book price.", "edge-strong"
 
     if parsed >= 0.02:
         return "Small value", "Worth reviewing, but the gap is not huge.", "edge-small"
 
     if parsed <= -0.02:
-        return "Price is high", "The book price is worse than the model number.", "edge-none"
+        return "Price is high", "The book price is worse than our number.", "edge-none"
 
-    return "Fair price", "The model and book are close.", "edge-none"
+    return "Fair price", "Win chance and book price are close.", "edge-none"
 
 
 def best_side_from_lookup(lookup: dict[str, dict]) -> str:
@@ -8967,7 +8967,7 @@ def render_beginner_pick_card(
             <div class="betting-pick-body">
                 <div class="betting-pick-main">
                     <div class="betting-pick-primary">
-                        <div class="betting-pick-label">Model pick</div>
+                        <div class="betting-pick-label">Suggested pick</div>
                         <div class="betting-pick-team">{html.escape(selection)}</div>
                         <div class="betting-pick-sub">
                             {html.escape(format_plain_percent(model_probability))} chance to win
@@ -9033,7 +9033,7 @@ def render_prop_beginner_card(
             <div class="betting-pick-body">
                 <div class="betting-pick-main">
                     <div class="betting-pick-primary">
-                        <div class="betting-pick-label">Model chance</div>
+                        <div class="betting-pick-label">Win chance</div>
                         <div class="betting-pick-team">{model_probability:.0%}</div>
                         <div class="betting-pick-sub">{html.escape(signal_note)}</div>
                         <div class="betting-meter">
@@ -9068,7 +9068,7 @@ def render_betting_summary(edge_rows: list[dict]) -> None:
         render_dashboard_cards(
             [
                 {"label": "Priced Picks", "value": "0", "note": "Add odds to compare games.", "color": "#64748b"},
-                {"label": "Good Value", "value": "0", "note": "Model sees a clear gap.", "color": "#16a34a"},
+                {"label": "Good Value", "value": "0", "note": "No clear price gap yet.", "color": "#16a34a"},
                 {"label": "Top Pick", "value": "-", "note": "No prices loaded yet.", "color": "#2563eb"},
             ]
         )
@@ -9081,7 +9081,7 @@ def render_betting_summary(edge_rows: list[dict]) -> None:
         render_dashboard_cards(
             [
                 {"label": "Priced Picks", "value": "0", "note": "Add odds to compare games.", "color": "#64748b"},
-                {"label": "Good Value", "value": "0", "note": "Model sees a clear gap.", "color": "#16a34a"},
+                {"label": "Good Value", "value": "0", "note": "No clear price gap yet.", "color": "#16a34a"},
                 {"label": "Top Pick", "value": "-", "note": "No prices loaded yet.", "color": "#2563eb"},
             ]
         )
@@ -9126,7 +9126,7 @@ def render_betting_summary(edge_rows: list[dict]) -> None:
     ).rename(
         columns={
             "Odds": "Book Price",
-            "Model": "Model Chance",
+            "Model": "Win Chance",
             "Market": "Book Chance",
             "Edge": "Price Gap",
         }
@@ -9136,7 +9136,7 @@ def render_betting_summary(edge_rows: list[dict]) -> None:
         <div class="betting-line-table">
             <div class="betting-game-title">Line comparison</div>
             <div class="betting-game-meta">
-                Sorted by expected value, then model edge.
+                Sorted by expected value, then price gap.
             </div>
         </div>
         """
@@ -9253,7 +9253,7 @@ def render_betting_side_tile(
             <div class="betting-game-meta">{html.escape(str(sportsbook))}</div>
             <div class="betting-side-meta-grid">
                 <div class="betting-side-meta">
-                    <div class="betting-side-meta-label">Model</div>
+                    <div class="betting-side-meta-label">Win</div>
                     <div class="betting-side-meta-value">{html.escape(format_plain_percent(model_probability))}</div>
                 </div>
                 <div class="betting-side-meta">
@@ -9367,7 +9367,7 @@ def render_moneyline_game_card(
                 </div>
                 <div class="betting-pick-row">
                     <div class="betting-pick-stat">
-                        <div class="betting-simple-label">Model chance</div>
+                        <div class="betting-simple-label">Win chance</div>
                         <div class="betting-simple-value">{html.escape(format_plain_percent(model_probability))}</div>
                     </div>
                     <div class="betting-pick-stat">
@@ -9577,7 +9577,7 @@ def render_bet_slip_panel(current_book_rows: list[dict] | None = None) -> None:
                     <div class="betting-simple-value">{html.escape(format_american_odds(live_odds))}</div>
                 </div>
                 <div class="bet-slip-stat">
-                    <div class="betting-simple-label">Model chance</div>
+                    <div class="betting-simple-label">Win chance</div>
                     <div class="betting-simple-value">{html.escape(format_plain_percent(model_probability))}</div>
                 </div>
                 <div class="bet-slip-stat">
@@ -9930,7 +9930,7 @@ def render_settled_betting_picks(limit: int = 48) -> None:
 
 @st.fragment(run_every=ODDS_REFRESH_SECONDS)
 def render_odds_board() -> None:
-    """Render moneyline odds and model-edge comparisons."""
+    """Render moneyline odds and price-gap comparisons."""
     st.caption(
         "Choose a team to win. Pick a sportsbook in the slip; odds update automatically and cannot be typed in."
     )
@@ -9944,7 +9944,7 @@ def render_odds_board() -> None:
     predictions = build_game_predictions(games)
 
     if predictions.empty:
-        st.warning("Game predictions are not available yet. Train the MLB model first.")
+        st.warning("Game picks are not available yet. Run the MLB data refresh first.")
         return
 
     api_key = get_configured_odds_api_key()
@@ -10168,7 +10168,7 @@ def render_player_props_lab() -> None:
     )
     metrics = [
         {"label": "Projection", "value": f"{projection:.2f}", "note": prop_type, "color": "#2563eb"},
-        {"label": "Model Chance", "value": f"{model_probability:.1%}", "note": f"{side} {line:g}", "color": "#16a34a"},
+        {"label": "Win Chance", "value": f"{model_probability:.1%}", "note": f"{side} {line:g}", "color": "#16a34a"},
         {"label": "Advanced Edge", "value": f"{ev:+.2f}" if ev is not None else "-", "note": format_signed_percent(edge), "color": "#7c3aed"},
     ]
 
@@ -10179,7 +10179,7 @@ def render_player_props_lab() -> None:
                 {
                     "Book Price": format_american_odds(odds),
                     "Book Chance": f"{market_probability:.1%}" if market_probability is not None else "-",
-                    "Model Chance": f"{model_probability:.1%}",
+                    "Win Chance": f"{model_probability:.1%}",
                     "Price Gap": format_signed_percent(edge),
                     "EV/Unit": f"{ev:+.2f}" if ev is not None else "-",
                     "Kelly": f"{kelly:.1%}" if kelly is not None else "-",
@@ -10463,7 +10463,7 @@ def render_sportsbook_connections_view() -> None:
 
 
 def render_bet_tracker_summary(tracker: pd.DataFrame) -> None:
-    """Render tracker performance cards."""
+    """Render tracker results cards."""
     if tracker.empty:
         render_dashboard_cards(
             [
@@ -10545,7 +10545,7 @@ def render_bet_tracker_view() -> None:
 
 
 def render_betting_backtest() -> None:
-    """Render tracker and model reliability breakdowns."""
+    """Render tracker and pricing-history breakdowns."""
     tracker = recalculate_tracker_results(load_bet_tracker())
     results = tracker["Result"].astype(str).str.lower() if not tracker.empty else pd.Series(dtype=str)
     settled = tracker[results.isin(["win", "loss", "push"])].copy() if not tracker.empty else pd.DataFrame()
@@ -10574,14 +10574,14 @@ def render_betting_backtest() -> None:
         grouped["Profit"] = grouped["Profit"].map(lambda value: f"${value:,.2f}")
         st.dataframe(grouped, hide_index=True, width="stretch")
     else:
-        st.info("Set bet results to Win/Loss/Push in the tracker to unlock edge-bucket performance.")
+        st.info("Set bet results to Win/Loss/Push in the tracker to unlock edge-bucket results.")
 
-    model_summary = build_team_backtest_summary(get_model_mtime())
+    pricing_summary = build_team_backtest_summary(get_model_mtime())
 
-    if not model_summary.empty:
-        with st.expander("Model-only historical check"):
-            st.caption("This shows historical model accuracy by team. It is model validation, not betting performance.")
-            display = model_summary.copy()
+    if not pricing_summary.empty:
+        with st.expander("Pricing-history check"):
+            st.caption("This shows historical pick results by team bucket. It is context, not a guarantee.")
+            display = pricing_summary.copy()
 
             for column in ["Accuracy", "Avg_Confidence", "Predicted", "Actual"]:
                 if column in display.columns:
@@ -10631,7 +10631,7 @@ def render_teams_view() -> None:
         ("League rank", f"#{league_rank}"),
         ("Win %", f"{float(row['SEASON_WIN_PCT']):.0%}"),
         ("Run diff/G", f"{float(row['SEASON_RUN_DIFF_PER_GAME']):+.1f}"),
-        ("Elo", f"{float(row['ELO']):.0f}"),
+        ("Power rating", f"{float(row['ELO']):.0f}"),
     ]
     metric_html = "".join(
         f"""
@@ -10856,7 +10856,7 @@ def render_model_view() -> None:
 def main() -> None:
     """Render MLB Streamlit app."""
     st.set_page_config(
-        page_title="MLB Prediction Model",
+        page_title="MLB Betting Dashboard",
         page_icon="⚾",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -10940,7 +10940,7 @@ def main() -> None:
                 <div class="sidebar-brand-mark">MLB</div>
                 <div class="sidebar-brand-text">
                     <div class="sidebar-brand-name">MLB Predictor</div>
-                    <div class="sidebar-brand-sub">Model dashboard</div>
+                    <div class="sidebar-brand-sub">Betting dashboard</div>
                 </div>
             </div>
             """,

@@ -1,11 +1,40 @@
-# NBA Prediction Model
+# Sports Betting Dashboard
 
-Streamlit app for NBA single-game, series, and bracket predictions.
+Unified Streamlit app for NBA and MLB betting research, odds comparison, saved
+picks, futures, and bankroll views.
 
-This repo now also includes a separate first-pass MLB predictor in `app_mlb.py`.
-It writes its own `mlb_*` data/model files and does not replace the NBA app.
+Run the combined app:
 
-## Free Data Refresh Commands
+```bash
+streamlit run app.py
+```
+
+The unified app keeps separate sport pages so more leagues can be added later.
+The original sport-specific dashboards are also available as standalone entry
+points:
+
+```bash
+streamlit run app_nba.py
+streamlit run app_mlb.py
+```
+
+## Unified App Features
+
+- Betting Hub with NBA/MLB overview cards
+- Daily sports brief with best-bet, closest-game, upset, watchability, and pick-movement panels
+- Unified Game Center for current slate games or manual matchups
+- What-If controls for NBA availability/rest swings and MLB starter/weather/bullpen swings
+- Odds board comparing win chance, book probability, fair odds, edge, EV/unit, and Kelly
+- Upset Radar and live upset-alert checks
+- Futures board with fair odds
+- Combined bet tracker across NBA and MLB picks
+- Pick-history snapshots and movement feed
+- Favorite-team tracking
+- Copy-ready pick cards
+
+## Data Refresh Commands
+
+These commands rebuild the internal pricing files used by the betting screens.
 
 ```bash
 python src/injuries.py
@@ -18,13 +47,13 @@ python src/train_model.py
 
 ## MLB App
 
-Run the MLB app separately:
+Run the standalone MLB app separately:
 
 ```bash
 streamlit run app_mlb.py
 ```
 
-Build or refresh the MLB data/model files:
+Build or refresh the MLB pricing files:
 
 ```bash
 python src/mlb_collect_data.py
@@ -34,8 +63,7 @@ python src/mlb_train_model.py
 ```
 
 The MLB version currently uses the public MLB Stats API, team form, rest, run
-differential, and Elo-style features. Pitcher and bullpen features are the next
-accuracy upgrade.
+differential, starter context, and power-rating inputs.
 
 `src/injuries.py` fetches the latest official NBA injury-report PDF for free and
 saves `data/current_injuries.csv`.
@@ -53,9 +81,9 @@ season:
 python src/injuries.py --historical --season 2025-26 --max-reports-per-season 1
 ```
 
-## Accuracy Features
+## Betting Workflow Features
 
-The model now includes:
+The app now includes:
 
 - rest and schedule features
 - road-trip game number
@@ -64,15 +92,15 @@ The model now includes:
 - playoff context features such as series game number, series score, elimination flags, and closeout flags
 - advanced efficiency and Four Factors features
 - current playoff series tracker with rest-of-series simulations
-- probability calibration table
-- key model-edge explanations
-- rolling season backtests
-- trained model/Elo blend settings
+- win-chance, book-chance, edge, fair-odds, EV/unit, and Kelly views
+- key betting-edge explanations
+- saved-pick tracking with active and settled bet views
+- pick-history snapshots and movement tracking
 
-Current official injuries are still applied live in the app when the model has
-not been trained on a full historical injury backfill.
+Current official injuries are still applied live in the NBA screens when a full
+historical injury backfill is not available.
 
 The historical injury backfill command is available, but the free official NBA
 pages may expose only limited historical rows. If `data/historical_injuries.csv`
-does not cover the historical games being trained, the model keeps injury
-features neutral and the app applies the latest official report live.
+does not cover older games, injury inputs stay neutral and the app applies the
+latest official report live.
